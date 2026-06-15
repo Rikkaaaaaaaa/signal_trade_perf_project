@@ -127,10 +127,57 @@ def _position_open_qty(positions: list[dict[str, object]]) -> int:
     return int(sum(int(pos["clientQty"]) for pos in positions))
 
 
+def _position_remaining_qty(position: dict[str, object]) -> int:
+    return int(position.get("remainingQty", position["clientQty"]))
+
+
+def _positions_remaining_qty(positions: list[dict[str, object]]) -> int:
+    return int(sum(_position_remaining_qty(pos) for pos in positions))
+
+
 def _scaled_client_filled_amt(position: dict[str, object], executed_qty: int, original_qty: int) -> float:
     if original_qty <= 0:
         return 0.0
     return float(position["clientFilledAmt"]) * executed_qty / original_qty
+
+
+def _merge_close_tick_volumes(sec_signal_df: pd.DataFrame, tick_df: pd.DataFrame) -> pd.DataFrame:
+    if sec_signal_df.empty:
+        return sec_signal_df
+
+    result_df = sec_signal_df.copy()
+    if tick_df.empty or "tickTime" not in tick_df.columns:
+        result_df["closeBidVol1Tick"] = np.nan
+        result_df["closeAskVol1Tick"] = np.nan
+        return result_df
+
+    left_df = result_df.reset_index().rename(columns={"index": "_signalRowIdx"}).sort_values("barTime")
+    right_df = (
+        tick_df[["tickTime", "bidVol1Tick", "askVol1Tick"]]
+        .dropna(subset=["tickTime"])
+        .sort_values("tickTime")
+        .reset_index(drop=True)
+    )
+    if right_df.empty:
+        result_df["closeBidVol1Tick"] = np.nan
+        result_df["closeAskVol1Tick"] = np.nan
+        return result_df
+
+    merged_df = pd.merge_asof(
+        left_df,
+        right_df,
+        left_on="barTime",
+        right_on="tickTime",
+        direction="backward",
+    )
+    merged_df = merged_df.sort_values("_signalRowIdx").drop(columns=["_signalRowIdx", "tickTime"])
+    merged_df = merged_df.rename(
+        columns={
+            "bidVol1Tick": "closeBidVol1Tick",
+            "askVol1Tick": "closeAskVol1Tick",
+        }
+    )
+    return merged_df.reset_index(drop=True)
 
 
 def _clip_position_by_cap(
@@ -138,11 +185,13 @@ def _clip_position_by_cap(
     open_positions_same_side: list[dict[str, object]],
     cap_column: str,
     cap_mode: str,
+    cap_multiplier: float = 1.0,
 ) -> tuple[dict[str, object], dict[str, object] | None]:
     original_qty = int(position["clientQty"])
     raw_cap = position.get(cap_column, np.nan)
-    cap_qty = int(np.floor(float(raw_cap))) if not pd.isna(raw_cap) else 0
-    current_qty = _position_open_qty(open_positions_same_side)
+    base_cap_qty = int(np.floor(float(raw_cap))) if not pd.isna(raw_cap) else 0
+    cap_qty = int(np.floor(base_cap_qty * cap_multiplier))
+    current_qty = _positions_remaining_qty(open_positions_same_side)
     available_qty = max(0, cap_qty - current_qty)
     executed_qty = min(original_qty, available_qty)
 
@@ -165,6 +214,8 @@ def _clip_position_by_cap(
         "matchStatus": "matched" if executed_qty > 0 else reason,
         "liquidityClipReason": reason,
         "positionCapMode": cap_mode,
+        "positionCapMultiplier": float(cap_multiplier),
+        "positionCapBaseQty": base_cap_qty,
         "positionCapQty": cap_qty,
         "positionCapAvailableQty": available_qty,
         "positionCapCurrentQtyBefore": current_qty,
@@ -180,9 +231,14 @@ def _clip_position_by_cap(
         "clientFilledAmt": _scaled_client_filled_amt(position, executed_qty, original_qty),
         "liquidityClipReason": reason,
         "positionCapMode": cap_mode,
+        "positionCapMultiplier": float(cap_multiplier),
+        "positionCapBaseQty": base_cap_qty,
         "positionCapQty": cap_qty,
         "positionCapAvailableQty": available_qty,
         "positionCapCurrentQtyBefore": current_qty,
+        "remainingQty": executed_qty,
+        "closeFillCount": 0,
+        "closedQty": 0,
     }
     return event, clipped_position
 
@@ -199,21 +255,179 @@ def _close_positions(
     prev_day_vol: float | None,
 ) -> list[dict[str, object]]:
     # 涨跌停风控触发时会一次性平掉同方向所有可平仓位，这里统一生成交易记录。
-    return [
-        _build_trade_record(
+    trade_rows: list[dict[str, object]] = []
+    for pos in positions:
+        close_qty = _position_remaining_qty(pos)
+        if close_qty <= 0:
+            continue
+        closed_before = int(pos.get("closedQty", 0))
+        closed_after = closed_before + close_qty
+        close_position = {
+            **pos,
+            "clientQty": close_qty,
+            "clientFilledAmt": _scaled_client_filled_amt(pos, close_qty, int(pos.get("clientQtyOriginal", pos["clientQty"]))),
+            "closeFillSeq": int(pos.get("closeFillCount", 0)) + 1,
+            "positionClosedQtyBefore": closed_before,
+            "positionClosedQtyAfter": closed_after,
+            "positionRemainingQtyAfter": 0,
+            "isPositionFullyClosed": True,
+        }
+        trade_rows.append(
+            _build_trade_record(
             pool_name=pool_name,
             security_code=security_code,
             trade_date=trade_date,
-            position=pos,
+            position=close_position,
             close_row=row,
-            hold_signal_count=int(row.name) - int(pos["openRowIdx"]),
+            hold_signal_count=int(row.name) - int(close_position["openRowIdx"]),
             close_type=close_type,
             price_bucket_low=price_bucket_low,
             price_bucket_high=price_bucket_high,
             prev_day_vol=prev_day_vol,
         )
-        for pos in positions
+        )
+    return trade_rows
+
+
+def _close_positions_with_volume_cap(
+    positions: list[dict[str, object]],
+    row: pd.Series,
+    pool_name: str,
+    security_code: str,
+    trade_date: pd.Timestamp,
+    close_type: str,
+    price_bucket_low: int,
+    price_bucket_high: int,
+    prev_day_vol: float | None,
+    close_volume: float,
+    force_close_all: bool = False,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    trade_rows: list[dict[str, object]] = []
+    if not positions:
+        return trade_rows, positions
+
+    remaining_close_qty = float("inf") if force_close_all else int(np.floor(close_volume)) if not pd.isna(close_volume) else 0
+    if remaining_close_qty <= 0:
+        return trade_rows, positions
+
+    still_open_positions: list[dict[str, object]] = []
+    for pos in positions:
+        pos_remaining_qty = _position_remaining_qty(pos)
+        if pos_remaining_qty <= 0:
+            continue
+        if remaining_close_qty <= 0:
+            still_open_positions.append(pos)
+            continue
+
+        fill_qty = pos_remaining_qty if force_close_all else min(pos_remaining_qty, int(remaining_close_qty))
+        if fill_qty <= 0:
+            still_open_positions.append(pos)
+            continue
+
+        closed_before = int(pos.get("closedQty", 0))
+        closed_after = closed_before + int(fill_qty)
+        remaining_after = pos_remaining_qty - int(fill_qty)
+        fill_seq = int(pos.get("closeFillCount", 0)) + 1
+        trade_position = {
+            **pos,
+            "clientQty": int(fill_qty),
+            "clientFilledAmt": _scaled_client_filled_amt(pos, int(fill_qty), int(pos.get("clientQtyOriginal", pos["clientQty"]))),
+            "closeFillSeq": fill_seq,
+            "positionClosedQtyBefore": closed_before,
+            "positionClosedQtyAfter": closed_after,
+            "positionRemainingQtyAfter": remaining_after,
+            "isPositionFullyClosed": remaining_after <= 0,
+        }
+        trade_rows.append(
+            _build_trade_record(
+                pool_name=pool_name,
+                security_code=security_code,
+                trade_date=trade_date,
+                position=trade_position,
+                close_row=row,
+                hold_signal_count=int(row.name) - int(pos["openRowIdx"]),
+                close_type=close_type if remaining_after <= 0 else f"{close_type}_PARTIAL",
+                price_bucket_low=price_bucket_low,
+                price_bucket_high=price_bucket_high,
+                prev_day_vol=prev_day_vol,
+            )
+        )
+
+        if not force_close_all:
+            remaining_close_qty -= int(fill_qty)
+        if remaining_after > 0:
+            still_open_positions.append(
+                {
+                    **pos,
+                    "remainingQty": remaining_after,
+                    "closedQty": closed_after,
+                    "closeFillCount": fill_seq,
+                }
+            )
+
+    return trade_rows, still_open_positions
+
+
+def _build_position_close_summary(partial_trade_df: pd.DataFrame, variant_tag: str) -> pd.DataFrame:
+    if partial_trade_df.empty:
+        return pd.DataFrame()
+
+    group_cols = [
+        "poolName",
+        "tradeDate",
+        "securityCode",
+        "side",
+        "strategySource",
+        "parentOrderId",
+        "clientOrderId",
+        "clientOrderTime",
+        "openTime",
+        "openSignalTime",
     ]
+    rows: list[dict[str, object]] = []
+    for key, group_df in partial_trade_df.groupby(group_cols, sort=True, dropna=False):
+        key_values = key if isinstance(key, tuple) else (key,)
+        row = dict(zip(group_cols, key_values))
+        qty = pd.to_numeric(group_df["clientQty"], errors="coerce").fillna(0)
+        open_notional = pd.to_numeric(group_df["openNotional"], errors="coerce").fillna(0.0)
+        exec_pnl = pd.to_numeric(group_df["execPnl"], errors="coerce").fillna(0.0)
+        mid_pnl = pd.to_numeric(group_df["midPnl"], errors="coerce").fillna(0.0)
+        close_price = np.where(
+            group_df["side"].iloc[0] == "LONG",
+            pd.to_numeric(group_df["closeBid1"], errors="coerce"),
+            pd.to_numeric(group_df["closeAsk1"], errors="coerce"),
+        )
+        weighted_close_price = (
+            float(np.nansum(close_price * qty) / qty.sum())
+            if float(qty.sum()) > 0
+            else np.nan
+        )
+        row.update(
+            {
+                "variantTag": variant_tag,
+                "openMid": float(group_df["openMid"].iloc[0]),
+                "openSignal": float(group_df["openSignal"].iloc[0]),
+                "clientQtyOriginal": int(group_df["clientQtyOriginal"].iloc[0]),
+                "filledCloseQty": int(qty.sum()),
+                "closeFillCount": int(len(group_df)),
+                "firstCloseTime": group_df["closeTime"].min(),
+                "lastCloseTime": group_df["closeTime"].max(),
+                "weightedClosePrice": weighted_close_price,
+                "totalExecPnl": float(exec_pnl.sum()),
+                "totalMidPnl": float(mid_pnl.sum()),
+                "openNotional": float(open_notional.sum()),
+                "notionalWeightedExecRet": (
+                    float(exec_pnl.sum() / open_notional.sum())
+                    if float(open_notional.sum()) != 0
+                    else np.nan
+                ),
+                "isPositionFullyClosed": bool(group_df["isPositionFullyClosed"].fillna(False).iloc[-1]),
+                "lastCloseType": group_df["closeType"].iloc[-1],
+            }
+        )
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 def _assign_price_bins(open_mid_price: pd.Series) -> tuple[pd.Series, pd.Series]:
@@ -435,12 +649,22 @@ def _build_trade_record(
         "liquidityCapQty": float(position["liquidityCapQty"]) if not pd.isna(position.get("liquidityCapQty", np.nan)) else np.nan,
         "liquidityClipReason": position.get("liquidityClipReason", "not_clipped"),
         "positionCapMode": position.get("positionCapMode", "none"),
+        "positionCapMultiplier": float(position.get("positionCapMultiplier", np.nan)),
+        "positionCapBaseQty": float(position.get("positionCapBaseQty", np.nan)),
         "positionCapQty": float(position.get("positionCapQty", np.nan)),
         "positionCapAvailableQty": float(position.get("positionCapAvailableQty", np.nan)),
         "positionCapCurrentQtyBefore": float(position.get("positionCapCurrentQtyBefore", np.nan)),
+        "closeFillSeq": int(position.get("closeFillSeq", 1)),
+        "closeFilledQty": qty,
+        "positionClosedQtyBefore": int(position.get("positionClosedQtyBefore", 0)),
+        "positionClosedQtyAfter": int(position.get("positionClosedQtyAfter", qty)),
+        "positionRemainingQtyAfter": int(position.get("positionRemainingQtyAfter", 0)),
+        "isPositionFullyClosed": bool(position.get("isPositionFullyClosed", True)),
         "closeMid": close_mid,
         "closeBid1": close_bid1,
         "closeAsk1": close_ask1,
+        "closeBidVol1Tick": float(close_row.get("closeBidVol1Tick", np.nan)) if not pd.isna(close_row.get("closeBidVol1Tick", np.nan)) else np.nan,
+        "closeAskVol1Tick": float(close_row.get("closeAskVol1Tick", np.nan)) if not pd.isna(close_row.get("closeAskVol1Tick", np.nan)) else np.nan,
         "closePriceSource": "ddb_returns" if not pd.isna(close_row.closeBid1Aligned) or not pd.isna(close_row.closeAsk1Aligned) else "missing",
         "holdSignalCount": int(hold_signal_count),
         "holdBars": int(hold_signal_count),
@@ -473,6 +697,8 @@ def _simulate_position_cap_lifecycle(
     cap_column: str,
     cap_mode: str,
     variant_column: str,
+    cap_multiplier: float = 1.0,
+    partial_close_by_tick_volume: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cap_event_rows: list[dict[str, object]] = []
     cap_trade_rows: list[dict[str, object]] = []
@@ -492,6 +718,7 @@ def _simulate_position_cap_lifecycle(
                 open_positions_same_side=same_side_positions,
                 cap_column=cap_column,
                 cap_mode=cap_mode,
+                cap_multiplier=cap_multiplier,
             )
             cap_event[variant_column] = True
             cap_event_rows.append(cap_event)
@@ -617,23 +844,45 @@ def _simulate_position_cap_lifecycle(
                 and row.merge_signal >= _close_threshold_for_position(params, idx - int(pos["openRowIdx"]))
             ]
             if eligible:
-                for pos in eligible:
-                    cap_trade_rows.append(
-                        _build_trade_record(
-                            pool_name=pool_name,
-                            security_code=security_code,
-                            trade_date=trade_date,
-                            position=pos,
-                            close_row=row,
-                            hold_signal_count=idx - int(pos["openRowIdx"]),
-                            close_type="SIGNAL",
-                            price_bucket_low=price_bucket_low,
-                            price_bucket_high=price_bucket_high,
-                            prev_day_vol=prev_day_vol,
-                        )
+                if partial_close_by_tick_volume:
+                    partial_trades, updated_eligible = _close_positions_with_volume_cap(
+                        positions=eligible,
+                        row=row,
+                        pool_name=pool_name,
+                        security_code=security_code,
+                        trade_date=trade_date,
+                        close_type="SIGNAL",
+                        price_bucket_low=price_bucket_low,
+                        price_bucket_high=price_bucket_high,
+                        prev_day_vol=prev_day_vol,
+                        close_volume=row.get("closeAskVol1Tick", np.nan),
                     )
-                eligible_ids = {_position_identity(pos) for pos in eligible}
-                short_open_positions = [pos for pos in short_open_positions if _position_identity(pos) not in eligible_ids]
+                    cap_trade_rows.extend(partial_trades)
+                    eligible_ids = {_position_identity(pos) for pos in eligible}
+                    remaining_by_id = {_position_identity(pos): pos for pos in updated_eligible}
+                    short_open_positions = [
+                        remaining_by_id.get(_position_identity(pos), pos)
+                        for pos in short_open_positions
+                        if _position_identity(pos) not in eligible_ids or _position_identity(pos) in remaining_by_id
+                    ]
+                else:
+                    for pos in eligible:
+                        cap_trade_rows.append(
+                            _build_trade_record(
+                                pool_name=pool_name,
+                                security_code=security_code,
+                                trade_date=trade_date,
+                                position=pos,
+                                close_row=row,
+                                hold_signal_count=idx - int(pos["openRowIdx"]),
+                                close_type="SIGNAL",
+                                price_bucket_low=price_bucket_low,
+                                price_bucket_high=price_bucket_high,
+                                prev_day_vol=prev_day_vol,
+                            )
+                        )
+                    eligible_ids = {_position_identity(pos) for pos in eligible}
+                    short_open_positions = [pos for pos in short_open_positions if _position_identity(pos) not in eligible_ids]
 
         if long_open_positions:
             eligible = [
@@ -643,23 +892,45 @@ def _simulate_position_cap_lifecycle(
                 and row.merge_signal <= -_close_threshold_for_position(params, idx - int(pos["openRowIdx"]))
             ]
             if eligible:
-                for pos in eligible:
-                    cap_trade_rows.append(
-                        _build_trade_record(
-                            pool_name=pool_name,
-                            security_code=security_code,
-                            trade_date=trade_date,
-                            position=pos,
-                            close_row=row,
-                            hold_signal_count=idx - int(pos["openRowIdx"]),
-                            close_type="SIGNAL",
-                            price_bucket_low=price_bucket_low,
-                            price_bucket_high=price_bucket_high,
-                            prev_day_vol=prev_day_vol,
-                        )
+                if partial_close_by_tick_volume:
+                    partial_trades, updated_eligible = _close_positions_with_volume_cap(
+                        positions=eligible,
+                        row=row,
+                        pool_name=pool_name,
+                        security_code=security_code,
+                        trade_date=trade_date,
+                        close_type="SIGNAL",
+                        price_bucket_low=price_bucket_low,
+                        price_bucket_high=price_bucket_high,
+                        prev_day_vol=prev_day_vol,
+                        close_volume=row.get("closeBidVol1Tick", np.nan),
                     )
-                eligible_ids = {_position_identity(pos) for pos in eligible}
-                long_open_positions = [pos for pos in long_open_positions if _position_identity(pos) not in eligible_ids]
+                    cap_trade_rows.extend(partial_trades)
+                    eligible_ids = {_position_identity(pos) for pos in eligible}
+                    remaining_by_id = {_position_identity(pos): pos for pos in updated_eligible}
+                    long_open_positions = [
+                        remaining_by_id.get(_position_identity(pos), pos)
+                        for pos in long_open_positions
+                        if _position_identity(pos) not in eligible_ids or _position_identity(pos) in remaining_by_id
+                    ]
+                else:
+                    for pos in eligible:
+                        cap_trade_rows.append(
+                            _build_trade_record(
+                                pool_name=pool_name,
+                                security_code=security_code,
+                                trade_date=trade_date,
+                                position=pos,
+                                close_row=row,
+                                hold_signal_count=idx - int(pos["openRowIdx"]),
+                                close_type="SIGNAL",
+                                price_bucket_low=price_bucket_low,
+                                price_bucket_high=price_bucket_high,
+                                prev_day_vol=prev_day_vol,
+                            )
+                        )
+                    eligible_ids = {_position_identity(pos) for pos in eligible}
+                    long_open_positions = [pos for pos in long_open_positions if _position_identity(pos) not in eligible_ids]
 
     if not sec_signal_df.empty:
         last_row = sec_signal_df.iloc[-1]
@@ -726,6 +997,8 @@ def simulate_internalization_day(
     trade_rows: list[dict[str, object]] = []
     summary_rows: list[dict[str, object]] = []
     position_cap_summary_frames: list[pd.DataFrame] = []
+    position_cap_trade_frames: list[pd.DataFrame] = []
+    position_cap_position_frames: list[pd.DataFrame] = []
 
     # 先按股票拆分 signal 和客户子单。只有两边都有数据的股票才进入逐票模拟，避免无意义拉 tick。
     signal_by_security = {
@@ -788,6 +1061,7 @@ def simulate_internalization_day(
         min_hold_signal_bars = _derive_min_hold_signal_bars(params)
         pending_match_rows: list[dict[str, object]] = []
         positions_by_open_idx: dict[int, list[dict[str, object]]] = {}
+        sec_tick_df = pd.DataFrame()
 
         # 第一段：逐笔客户子单寻找开仓 signal。信号必须先到，客户单必须在窗口内跟上。
         for order in sec_orders_df.to_dict(orient="records"):
@@ -864,9 +1138,10 @@ def simulate_internalization_day(
 
         # 第二段：给已经通过 signal 检查的子单补开仓 tick mid；如果最近 tick mid 为空，则不能开仓。
         if pending_match_rows:
+            sec_tick_df = tick_mid_cache.get(security_code)
             matched_order_df = _load_latest_tick_mid_for_orders(
                 matched_order_df=pd.DataFrame(pending_match_rows),
-                tick_df=tick_mid_cache.get(security_code),
+                tick_df=sec_tick_df,
             )
 
             for row in matched_order_df.to_dict(orient="records"):
@@ -909,6 +1184,9 @@ def simulate_internalization_day(
                         "matched": True,
                     }
                 )
+
+        if positions_by_open_idx:
+            sec_signal_df = _merge_close_tick_volumes(sec_signal_df, sec_tick_df)
 
         matched_order_df = pd.DataFrame(
             [row for row in event_rows if row["securityCode"] == security_code and bool(row["matched"])]
@@ -1249,9 +1527,10 @@ def simulate_internalization_day(
 
         if positions_by_open_idx:
             base_sec_summary_df = pd.DataFrame([security_summary])
-            for variant_tag, cap_column, cap_mode, variant_column in [
-                ("poscap_min5", "liquidityCapQtyMin5", "min5", "variantPoscapMin5"),
-                ("poscap_avg5", "liquidityCapQtyAvg5", "avg5", "variantPoscapAvg5"),
+            for variant_tag, cap_column, cap_mode, variant_column, cap_multiplier, partial_close_by_tick_volume in [
+                ("poscap_min5", "liquidityCapQtyMin5", "min5", "variantPoscapMin5", 1.0, False),
+                ("poscap_avg5", "liquidityCapQtyAvg5", "avg5", "variantPoscapAvg5", 1.0, False),
+                ("poscap_avg5x5_partial", "liquidityCapQtyAvg5", "avg5x5_partial", "variantPoscapAvg5x5Partial", 5.0, True),
             ]:
                 cap_events_df, cap_trades_df = _simulate_position_cap_lifecycle(
                     candidate_positions_by_open_idx=positions_by_open_idx,
@@ -1268,7 +1547,17 @@ def simulate_internalization_day(
                     cap_column=cap_column,
                     cap_mode=cap_mode,
                     variant_column=variant_column,
+                    cap_multiplier=cap_multiplier,
+                    partial_close_by_tick_volume=partial_close_by_tick_volume,
                 )
+                if not cap_trades_df.empty:
+                    cap_trades_df = cap_trades_df.copy()
+                    cap_trades_df["variantTag"] = variant_tag
+                    position_cap_trade_frames.append(cap_trades_df)
+                    if partial_close_by_tick_volume:
+                        position_summary_df = _build_position_close_summary(cap_trades_df, variant_tag=variant_tag)
+                        if not position_summary_df.empty:
+                            position_cap_position_frames.append(position_summary_df)
                 cap_summary_df = build_variant_security_summary(
                     base_security_summary_df=base_sec_summary_df,
                     order_events_df=cap_events_df,
@@ -1292,10 +1581,20 @@ def simulate_internalization_day(
         if position_cap_summary_frames
         else pd.DataFrame()
     )
+    security_summary_df.attrs["position_cap_trades"] = (
+        pd.concat(position_cap_trade_frames, ignore_index=True)
+        if position_cap_trade_frames
+        else pd.DataFrame()
+    )
+    security_summary_df.attrs["position_close_summaries"] = (
+        pd.concat(position_cap_position_frames, ignore_index=True)
+        if position_cap_position_frames
+        else pd.DataFrame()
+    )
     return order_events_df, trades_df, security_summary_df
 
 
-VARIANT_TAGS = ["all", "lt1000", "lt2000", "liqcap5tick", "poscap_min5", "poscap_avg5"]
+VARIANT_TAGS = ["all", "lt1000", "lt2000", "liqcap5tick", "poscap_min5", "poscap_avg5", "poscap_avg5x5_partial"]
 
 
 def _add_variant_flags(df: pd.DataFrame) -> pd.DataFrame:
@@ -1318,6 +1617,8 @@ def _add_variant_flags(df: pd.DataFrame) -> pd.DataFrame:
         flagged_df["variantPoscapMin5"] = False
     if "variantPoscapAvg5" not in flagged_df.columns:
         flagged_df["variantPoscapAvg5"] = False
+    if "variantPoscapAvg5x5Partial" not in flagged_df.columns:
+        flagged_df["variantPoscapAvg5x5Partial"] = False
     return flagged_df
 
 
@@ -1334,6 +1635,8 @@ def _variant_mask(df: pd.DataFrame, variant_tag: str) -> pd.Series:
         return df["variantPoscapMin5"].fillna(False)
     if variant_tag == "poscap_avg5":
         return df["variantPoscapAvg5"].fillna(False)
+    if variant_tag == "poscap_avg5x5_partial":
+        return df["variantPoscapAvg5x5Partial"].fillna(False)
     raise ValueError(f"Unknown variant_tag: {variant_tag}")
 
 
@@ -1822,6 +2125,8 @@ def run_internalization_prepared_day(
             tickLoadCount=tick_mid_cache.load_count,
             tickLoadSeconds=f"{tick_mid_cache.load_seconds:.2f}",
         )
+        position_cap_trades_df = base_security_summary_df.attrs.get("position_cap_trades", pd.DataFrame())
+        position_close_summary_df = base_security_summary_df.attrs.get("position_close_summaries", pd.DataFrame())
         stage_start = perf_counter()
         order_events_df = _add_variant_flags(order_events_df)
         trades_df = _add_variant_flags(trades_df)
@@ -1848,7 +2153,7 @@ def run_internalization_prepared_day(
             )
         position_cap_summary_df = base_security_summary_df.attrs.get("position_cap_summaries", pd.DataFrame())
         if not position_cap_summary_df.empty:
-            for variant_tag in ["poscap_min5", "poscap_avg5"]:
+            for variant_tag in ["poscap_min5", "poscap_avg5", "poscap_avg5x5_partial"]:
                 cap_variant_summary_df = position_cap_summary_df[
                     position_cap_summary_df["variantTag"] == variant_tag
                 ].copy()
@@ -1867,8 +2172,12 @@ def run_internalization_prepared_day(
 
     security_summary_df = pd.concat(all_security_summaries, ignore_index=True) if all_security_summaries else pd.DataFrame()
     pool_summary_df = pd.concat(pool_summary_frames, ignore_index=True) if pool_summary_frames else pd.DataFrame()
+    trades_df.attrs["position_cap_trades"] = position_cap_trades_df
+    trades_df.attrs["position_close_summaries"] = position_close_summary_df
     security_summary_df = format_internalization_security_summary_for_output(security_summary_df)
     pool_summary_df = format_internalization_pool_summary_for_output(pool_summary_df)
+    trades_df.attrs["position_cap_trades"] = position_cap_trades_df
+    trades_df.attrs["position_close_summaries"] = position_close_summary_df
     return order_events_df, trades_df, security_summary_df, pool_summary_df
 
 

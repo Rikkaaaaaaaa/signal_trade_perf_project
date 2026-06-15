@@ -20,7 +20,7 @@ POOL_NAMES = ["hs300", "zz500", "zz1000", "zz2000_1", "zz2000_2", "zz2000_3", "o
 # POOL_NAMES = ["zz2000_3"]
 
 
-REPORT_VARIANT_ORDER = ["all", "lt1000", "lt2000", "liqcap5tick", "poscap_min5", "poscap_avg5"]
+REPORT_VARIANT_ORDER = ["all", "lt1000", "lt2000", "liqcap5tick", "poscap_min5", "poscap_avg5", "poscap_avg5x5_partial"]
 CORE_METRIC_COLUMNS = [
     "totalTradeCount",
     "totalExecPnl",
@@ -28,6 +28,13 @@ CORE_METRIC_COLUMNS = [
     "notionalWeightedExecRet",
     "totalMatchedNotional",
 ]
+
+
+def _parse_match_window(raw: str) -> int | None:
+    token = str(raw).strip().lower()
+    if token in {"none", "unlimited", "all", "不限"}:
+        return None
+    return int(token)
 
 
 def _variant_metric_rows(pool_summary_df: pd.DataFrame) -> list[dict[str, object]]:
@@ -83,9 +90,10 @@ def main() -> None:
     parser.add_argument("--open-threshold", type=float, default=6.0)
     parser.add_argument("--close-threshold", type=float, default=4.0)
     parser.add_argument("--min-hold-bars", type=int, default=5)
-    parser.add_argument("--match-window-seconds", type=int, default=10)
+    parser.add_argument("--match-window-seconds", default="10")
     parser.add_argument("--profile", action="store_true", help="Print stage timing diagnostics to stdout.")
     args = parser.parse_args()
+    match_window_seconds = _parse_match_window(args.match_window_seconds)
 
     params = BacktestParams(
         open_threshold=args.open_threshold,
@@ -115,7 +123,7 @@ def main() -> None:
             pool_name=pool_name,
             params=params,
             ims_roots=get_default_ims_roots(PROJECT_ROOT),
-            match_window_seconds=args.match_window_seconds,
+            match_window_seconds=match_window_seconds,
             profile=args.profile,
         )
         pool_elapsed = perf_counter() - pool_start
@@ -126,6 +134,22 @@ def main() -> None:
 
         dataframe_to_csv_with_retry(order_events_df, pool_dir / "order_events.csv", index=False, date_format=datetime_format)
         dataframe_to_csv_with_retry(trades_df, pool_dir / "trades.csv", index=False, date_format=datetime_format)
+        position_cap_trades_df = trades_df.attrs.get("position_cap_trades", pd.DataFrame())
+        position_close_summary_df = trades_df.attrs.get("position_close_summaries", pd.DataFrame())
+        if not position_cap_trades_df.empty:
+            dataframe_to_csv_with_retry(
+                position_cap_trades_df,
+                pool_dir / "position_cap_trades.csv",
+                index=False,
+                date_format=datetime_format,
+            )
+        if not position_close_summary_df.empty:
+            dataframe_to_csv_with_retry(
+                position_close_summary_df,
+                pool_dir / "position_close_summary.csv",
+                index=False,
+                date_format=datetime_format,
+            )
         dataframe_to_csv_with_retry(security_summary_df, pool_dir / "security_summary.csv", index=False, date_format=datetime_format)
         dataframe_to_csv_with_retry(pool_summary_df, pool_dir / "pool_summary.csv", index=False, date_format=datetime_format)
 

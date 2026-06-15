@@ -29,7 +29,7 @@ from signal_trade_perf.source_backtest import dataframe_to_csv_with_retry, mkdir
 
 
 POOL_NAMES = ["hs300", "zz500", "zz1000", "zz2000_1", "zz2000_2", "zz2000_3", "other"]
-VARIANT_ORDER = ["all", "lt1000", "lt2000", "liqcap5tick", "poscap_min5", "poscap_avg5"]
+VARIANT_ORDER = ["all", "lt1000", "lt2000", "liqcap5tick", "poscap_min5", "poscap_avg5", "poscap_avg5x5_partial"]
 CORE_SUM_COLUMNS = [
     "totalTradeCount",
     "totalExecPnl",
