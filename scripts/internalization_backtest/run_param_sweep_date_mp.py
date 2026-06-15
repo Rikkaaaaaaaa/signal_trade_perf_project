@@ -112,6 +112,10 @@ def _parse_pools(raw: str) -> list[str]:
     return pools
 
 
+def _parse_path_list(raw: str) -> list[Path]:
+    return [Path(value.strip()) for value in raw.split(",") if value.strip()]
+
+
 def _match_window_tag(match_window_seconds: int | None) -> str:
     return "match_unlimited" if match_window_seconds is None else f"match_{match_window_seconds}"
 
@@ -249,6 +253,8 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
             "openThreshold": params.open_threshold,
             "closeThreshold": params.close_threshold,
             "minHoldBars": params.min_hold_bars,
+            "relaxedCloseAfterBars": params.relaxed_close_after_bars,
+            "relaxedCloseThreshold": params.relaxed_close_threshold,
             "matchWindowSeconds": _match_window_value(match_window_seconds),
             "elapsedSeconds": perf_counter() - start,
             "status": "ok" if pool_rows else "skipped_empty_result",
@@ -440,6 +446,31 @@ def _write_date_checkpoint(combo_dir: Path, result: dict[str, Any], pool_rows: l
     dataframe_to_csv_with_retry(timing_df, checkpoint_dir / f"{trade_date}_timing.csv", index=False)
 
 
+def _write_progress_status(output_root: Path, progress_rows: list[dict[str, Any]]) -> None:
+    if not progress_rows:
+        return
+    progress_df = pd.DataFrame(progress_rows)
+    first_cols = [
+        "comboIndex",
+        "comboCount",
+        "comboTag",
+        "status",
+        "completedDateCount",
+        "tradeDateCount",
+        "latestTradeDate",
+        "latestWriteTime",
+        "okDateCount",
+        "errorDateCount",
+        "elapsedSeconds",
+    ]
+    ordered_first = [col for col in first_cols if col in progress_df.columns]
+    dataframe_to_csv_with_retry(
+        progress_df[ordered_first + [col for col in progress_df.columns if col not in ordered_first]],
+        output_root / "progress_status.csv",
+        index=False,
+    )
+
+
 def _read_date_checkpoint(combo_dir: Path, trade_date: str) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
     checkpoint_dir = combo_dir / "daily_checkpoints"
     pool_summary_path = checkpoint_dir / f"{trade_date}_pool_summary.csv"
@@ -468,13 +499,19 @@ def main() -> None:
     )
     parser.add_argument("--match-window-seconds-list", default="5,10,unlimited")
     parser.add_argument("--pools", default="all")
+    parser.add_argument(
+        "--ims-roots",
+        default="",
+        help="Comma-separated IMS root directories. Default: all subdirectories under PROJECT_ROOT/ims_backtest_data.",
+    )
     parser.add_argument("--output-root", default=str(PROJECT_ROOT / "results" / "internalization_backtest" / "param_sweep_date_mp"))
     parser.add_argument("--cache-mode", choices=["none", "readwrite", "refresh"], default="readwrite")
     parser.add_argument("--cache-root", default=str(PROJECT_ROOT / "results" / "internalization_backtest" / "data_cache"))
     parser.add_argument("--resume", action="store_true", help="Reuse completed daily checkpoints for the same combo output directory.")
     args = parser.parse_args()
 
-    ims_roots = get_default_ims_roots(PROJECT_ROOT)
+    ims_roots = _parse_path_list(args.ims_roots) if args.ims_roots.strip() else get_default_ims_roots(PROJECT_ROOT)
+    ims_roots = [path.resolve() for path in ims_roots]
     trade_dates = _discover_ims_trade_dates(ims_roots, args.start_date, args.end_date)
     if not trade_dates:
         raise ValueError(f"No IMS trade dates found in [{args.start_date}, {args.end_date}]")
@@ -509,6 +546,7 @@ def main() -> None:
     print(f"paramComboCount={len(param_grid)}")
     print(f"processes={args.processes}")
     print(f"pools={','.join(pools)}")
+    print(f"imsRoots={','.join(str(path) for path in ims_roots)}")
     print(f"cacheMode={args.cache_mode}")
     print(f"cacheRoot={args.cache_root}")
     print(f"outputRoot={output_root}")
@@ -516,6 +554,7 @@ def main() -> None:
     all_daily_summaries: list[pd.DataFrame] = []
     all_total_summaries: list[pd.DataFrame] = []
     all_combo_timing_rows: list[dict[str, Any]] = []
+    progress_rows: list[dict[str, Any]] = []
     total_start = perf_counter()
 
     context = mp.get_context("spawn")
@@ -538,6 +577,21 @@ def main() -> None:
         combo_dir = output_root / combo_tag
         combo_start = perf_counter()
         print(f"[combo {combo_idx}/{len(param_grid)}] start {combo_tag}")
+        progress_row = {
+            "comboIndex": combo_idx,
+            "comboCount": len(param_grid),
+            "comboTag": combo_tag,
+            "status": "running",
+            "completedDateCount": 0,
+            "tradeDateCount": len(trade_dates),
+            "latestTradeDate": "",
+            "latestWriteTime": "",
+            "okDateCount": 0,
+            "errorDateCount": 0,
+            "elapsedSeconds": 0.0,
+        }
+        progress_rows.append(progress_row)
+        _write_progress_status(output_root, progress_rows)
 
         pool_rows: list[dict[str, Any]] = []
         timing_rows: list[dict[str, Any]] = []
@@ -568,19 +622,33 @@ def main() -> None:
                 checkpoint_pool_rows, checkpoint_timing_row = checkpoint
                 pool_rows.extend(checkpoint_pool_rows)
                 timing_rows.append(checkpoint_timing_row)
+                progress_row["completedDateCount"] = len(timing_rows)
+                progress_row["latestTradeDate"] = trade_date
+                progress_row["latestWriteTime"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                progress_row["okDateCount"] = sum(1 for row in timing_rows if row.get("status") == "ok")
+                progress_row["errorDateCount"] = sum(1 for row in timing_rows if row.get("status") == "error")
+                progress_row["elapsedSeconds"] = perf_counter() - combo_start
+                _write_progress_status(output_root, progress_rows)
                 print(f"[combo {combo_idx}/{len(param_grid)}] [resume] {trade_date} loaded checkpoint")
             tasks = pending_tasks
 
         with context.Pool(processes=args.processes) as pool:
-            for done_count, result in enumerate(pool.imap_unordered(_run_one_date, tasks), start=1):
+            for result in pool.imap_unordered(_run_one_date, tasks):
                 date_pool_rows = result["poolRows"]
                 _write_date_checkpoint(combo_dir, result, date_pool_rows)
                 pool_rows.extend(date_pool_rows)
                 result = {key: value for key, value in result.items() if key != "poolRows"}
                 timing_rows.append(result)
+                progress_row["completedDateCount"] = len(timing_rows)
+                progress_row["latestTradeDate"] = result["tradeDate"]
+                progress_row["latestWriteTime"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                progress_row["okDateCount"] = sum(1 for row in timing_rows if row.get("status") == "ok")
+                progress_row["errorDateCount"] = sum(1 for row in timing_rows if row.get("status") == "error")
+                progress_row["elapsedSeconds"] = perf_counter() - combo_start
+                _write_progress_status(output_root, progress_rows)
                 print(
                     f"[combo {combo_idx}/{len(param_grid)}] "
-                    f"[date {done_count}/{len(trade_dates)}] {result['tradeDate']} "
+                    f"[date {len(timing_rows)}/{len(trade_dates)}] {result['tradeDate']} "
                     f"status={result['status']} elapsed={float(result['elapsedSeconds']):.2f}s "
                     f"cacheHits={result['cacheHits']} cacheMisses={result['cacheMisses']} cacheWrites={result['cacheWrites']}"
                 )
@@ -615,6 +683,13 @@ def main() -> None:
         all_combo_timing_rows.append(combo_timing_row)
 
         print(f"[combo {combo_idx}/{len(param_grid)}] done {combo_tag} elapsedSeconds={combo_elapsed:.2f}")
+        progress_row["status"] = "done"
+        progress_row["completedDateCount"] = len(timing_rows)
+        progress_row["latestWriteTime"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        progress_row["okDateCount"] = int((date_timing_df["status"] == "ok").sum()) if not date_timing_df.empty else 0
+        progress_row["errorDateCount"] = int((date_timing_df["status"] == "error").sum()) if not date_timing_df.empty else 0
+        progress_row["elapsedSeconds"] = combo_elapsed
+        _write_progress_status(output_root, progress_rows)
         _print_daily_report(total_all_dates_df.assign(tradeDate="ALL_DATES"))
 
     combined_daily_df = pd.concat(all_daily_summaries, ignore_index=True) if all_daily_summaries else pd.DataFrame()
