@@ -17,6 +17,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+import numpy as np
 import pandas as pd
 
 from signal_trade_perf.internalization_backtest import (
@@ -25,6 +26,7 @@ from signal_trade_perf.internalization_backtest import (
     load_internalization_day_inputs,
     run_internalization_prepared_day,
 )
+from signal_trade_perf.internalization_capital import build_capital_event_rows, capital_metrics_by_variant
 from signal_trade_perf.source_backtest import dataframe_to_csv_with_retry, mkdir_with_retry
 
 
@@ -40,6 +42,9 @@ CORE_SUM_COLUMNS = [
 CORE_REPORT_COLUMNS = [
     "totalTradeCount",
     "totalExecPnl",
+    "maxCapitalUsed",
+    "p95CapitalUsedByEvent",
+    "capitalAdjustedReturn",
     "clientAmtMatchRate",
     "notionalWeightedExecRet",
     "byDateWinRate",
@@ -154,6 +159,7 @@ def _empty_result(trade_date: str, params: BacktestParams, match_window_seconds:
         "cacheMisses": 0,
         "cacheWrites": 0,
         "poolRows": [],
+        "dailyCapitalRows": [],
     }
 
 
@@ -198,6 +204,7 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
     start = perf_counter()
     pool_rows: list[dict[str, Any]] = []
     skipped_pools: list[str] = []
+    capital_event_rows: list[dict[str, Any]] = []
     cache_hits = 0
     cache_misses = 0
     cache_writes = 0
@@ -229,7 +236,7 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
                 skipped_pools.append(pool_name)
                 continue
 
-            _, _, _, pool_summary_df = run_internalization_prepared_day(
+            _, trades_df, _, pool_summary_df = run_internalization_prepared_day(
                 prepared_inputs=prepared_inputs,
                 params=params,
                 match_window_seconds=match_window_seconds,
@@ -246,6 +253,28 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
             pool_summary_df["relaxedCloseAfterBars"] = params.relaxed_close_after_bars
             pool_summary_df["relaxedCloseThreshold"] = params.relaxed_close_threshold
             pool_rows.extend(pool_summary_df.to_dict(orient="records"))
+            capital_event_rows.extend(
+                build_capital_event_rows(
+                    trades_df=trades_df,
+                    position_cap_trades_df=trades_df.attrs.get("position_cap_trades", pd.DataFrame()),
+                    variant_tags=VARIANT_ORDER,
+                )
+            )
+
+        daily_capital_rows = capital_metrics_by_variant(
+            event_rows=capital_event_rows,
+            base_row={
+                "tradeDate": trade_date,
+                "paramTag": params.param_tag,
+                "openThreshold": params.open_threshold,
+                "closeThreshold": params.close_threshold,
+                "minHoldBars": params.min_hold_bars,
+                "relaxedCloseAfterBars": params.relaxed_close_after_bars,
+                "relaxedCloseThreshold": params.relaxed_close_threshold,
+                "matchWindowSeconds": _match_window_value(match_window_seconds),
+            },
+            variant_tags=VARIANT_ORDER,
+        )
 
         return {
             "tradeDate": trade_date,
@@ -263,6 +292,7 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
             "cacheMisses": cache_misses,
             "cacheWrites": cache_writes,
             "poolRows": pool_rows,
+            "dailyCapitalRows": daily_capital_rows,
         }
     except Exception:
         return _empty_result(
@@ -310,6 +340,107 @@ def _aggregate_core_rows(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFram
     return result_df
 
 
+CAPITAL_MERGE_COLUMNS = [
+    "tradeDate",
+    "variantTag",
+    "paramTag",
+    "openThreshold",
+    "closeThreshold",
+    "minHoldBars",
+    "relaxedCloseAfterBars",
+    "relaxedCloseThreshold",
+    "matchWindowSeconds",
+]
+
+
+def _with_stable_merge_keys(df: pd.DataFrame, merge_cols: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    keyed_df = df.copy()
+    key_cols: list[str] = []
+    for col in merge_cols:
+        key_col = f"__merge_key_{col}"
+        keyed_df[key_col] = keyed_df[col].astype("string").fillna("<NA>")
+        key_cols.append(key_col)
+    return keyed_df, key_cols
+
+
+def _merge_daily_capital_metrics(daily_df: pd.DataFrame, daily_capital_df: pd.DataFrame) -> pd.DataFrame:
+    if daily_df.empty:
+        return daily_df
+    if daily_capital_df.empty:
+        result_df = daily_df.copy()
+        result_df["maxCapitalUsed"] = 0.0
+        result_df["p95CapitalUsedByEvent"] = 0.0
+    else:
+        merge_cols = [col for col in CAPITAL_MERGE_COLUMNS if col in daily_df.columns and col in daily_capital_df.columns]
+        left_df, key_cols = _with_stable_merge_keys(daily_df, merge_cols)
+        right_df, _ = _with_stable_merge_keys(daily_capital_df, merge_cols)
+        result_df = left_df.merge(
+            right_df[key_cols + ["maxCapitalUsed", "p95CapitalUsedByEvent"]],
+            on=key_cols,
+            how="left",
+        ).drop(columns=key_cols)
+        result_df["maxCapitalUsed"] = pd.to_numeric(result_df["maxCapitalUsed"], errors="coerce").fillna(0.0)
+        result_df["p95CapitalUsedByEvent"] = pd.to_numeric(result_df["p95CapitalUsedByEvent"], errors="coerce").fillna(0.0)
+
+    result_df["capitalAdjustedReturn"] = np.where(
+        result_df["maxCapitalUsed"] == 0,
+        np.nan,
+        pd.to_numeric(result_df["totalExecPnl"], errors="coerce") / result_df["maxCapitalUsed"],
+    )
+    return result_df
+
+
+def _add_daily_capital_summary_metrics(total_df: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataFrame:
+    if total_df.empty or daily_df.empty or "maxCapitalUsed" not in daily_df.columns:
+        return total_df
+
+    merge_cols = [
+        col
+        for col in [
+            "variantTag",
+            "paramTag",
+            "openThreshold",
+            "closeThreshold",
+            "minHoldBars",
+            "relaxedCloseAfterBars",
+            "relaxedCloseThreshold",
+            "matchWindowSeconds",
+        ]
+        if col in total_df.columns and col in daily_df.columns
+    ]
+    metric_rows: list[dict[str, Any]] = []
+    for key, group_df in daily_df.groupby(merge_cols, sort=False, dropna=False):
+        key_values = key if isinstance(key, tuple) else (key,)
+        daily_capital = pd.to_numeric(group_df["maxCapitalUsed"], errors="coerce").dropna()
+        row = dict(zip(merge_cols, key_values))
+        row.update(
+            {
+                "maxDailyCapitalUsed": float(daily_capital.max()) if len(daily_capital) else 0.0,
+                "p95DailyCapitalUsed": float(daily_capital.quantile(0.95)) if len(daily_capital) else 0.0,
+                "avgDailyCapitalUsed": float(daily_capital.mean()) if len(daily_capital) else 0.0,
+            }
+        )
+        metric_rows.append(row)
+
+    metric_df = pd.DataFrame(metric_rows)
+    if metric_df.empty:
+        return total_df
+
+    left_df, key_cols = _with_stable_merge_keys(total_df, merge_cols)
+    right_df, _ = _with_stable_merge_keys(metric_df, merge_cols)
+    enriched_df = left_df.merge(
+        right_df[key_cols + ["maxDailyCapitalUsed", "p95DailyCapitalUsed", "avgDailyCapitalUsed"]],
+        on=key_cols,
+        how="left",
+    ).drop(columns=key_cols)
+    enriched_df["capitalAdjustedReturn"] = np.where(
+        enriched_df["maxDailyCapitalUsed"] == 0,
+        np.nan,
+        pd.to_numeric(enriched_df["totalExecPnl"], errors="coerce") / enriched_df["maxDailyCapitalUsed"],
+    )
+    return enriched_df
+
+
 def _add_by_date_return_metrics(total_df: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataFrame:
     if total_df.empty or daily_df.empty or "tradeDate" not in daily_df.columns:
         return total_df
@@ -346,7 +477,13 @@ def _add_by_date_return_metrics(total_df: pd.DataFrame, daily_df: pd.DataFrame) 
     metric_df = pd.DataFrame(metric_rows)
     if metric_df.empty:
         return total_df
-    enriched_df = total_df.merge(metric_df, on=merge_cols, how="left")
+    left_df, key_cols = _with_stable_merge_keys(total_df, merge_cols)
+    right_df, _ = _with_stable_merge_keys(metric_df, merge_cols)
+    enriched_df = left_df.merge(
+        right_df[key_cols + ["byDateWinRate", "byDateRetMean", "byDateRetStd"]],
+        on=key_cols,
+        how="left",
+    ).drop(columns=key_cols)
     first_cols = [
         "variantTag",
         "paramTag",
@@ -358,6 +495,10 @@ def _add_by_date_return_metrics(total_df: pd.DataFrame, daily_df: pd.DataFrame) 
         "matchWindowSeconds",
         "totalTradeCount",
         "totalExecPnl",
+        "maxDailyCapitalUsed",
+        "p95DailyCapitalUsed",
+        "avgDailyCapitalUsed",
+        "capitalAdjustedReturn",
         "clientAmtMatchRate",
         "notionalWeightedExecRet",
         "byDateWinRate",
@@ -381,6 +522,7 @@ def _write_combo_outputs(
     pool_summary_df: pd.DataFrame,
     date_timing_df: pd.DataFrame,
     combo_timing_row: dict[str, Any],
+    daily_capital_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     mkdir_with_retry(combo_dir)
     daily_all_pool_df = _aggregate_core_rows(
@@ -397,6 +539,7 @@ def _write_combo_outputs(
             "matchWindowSeconds",
         ],
     )
+    daily_all_pool_df = _merge_daily_capital_metrics(daily_all_pool_df, daily_capital_df)
     total_all_dates_df = _aggregate_core_rows(
         pool_summary_df,
         [
@@ -410,11 +553,13 @@ def _write_combo_outputs(
             "matchWindowSeconds",
         ],
     )
+    total_all_dates_df = _add_daily_capital_summary_metrics(total_all_dates_df, daily_all_pool_df)
     total_all_dates_df = _add_by_date_return_metrics(total_all_dates_df, daily_all_pool_df)
     combo_timing_df = pd.DataFrame([combo_timing_row])
 
     dataframe_to_csv_with_retry(pool_summary_df, combo_dir / "daily_pool_summary.csv", index=False)
     dataframe_to_csv_with_retry(daily_all_pool_df, combo_dir / "daily_all_pool_summary.csv", index=False)
+    dataframe_to_csv_with_retry(daily_capital_df, combo_dir / "daily_capital_summary.csv", index=False)
     dataframe_to_csv_with_retry(total_all_dates_df, combo_dir / "total_all_dates_summary.csv", index=False)
     dataframe_to_csv_with_retry(date_timing_df, combo_dir / "date_timing.csv", index=False)
     dataframe_to_csv_with_retry(combo_timing_df, combo_dir / "combo_timing.csv", index=False)
@@ -440,9 +585,12 @@ def _write_date_checkpoint(combo_dir: Path, result: dict[str, Any], pool_rows: l
             "matchWindowSeconds",
         ],
     )
-    timing_df = pd.DataFrame([{key: value for key, value in result.items() if key != "poolRows"}])
+    daily_capital_df = pd.DataFrame(result.get("dailyCapitalRows", []))
+    daily_all_pool_df = _merge_daily_capital_metrics(daily_all_pool_df, daily_capital_df)
+    timing_df = pd.DataFrame([{key: value for key, value in result.items() if key not in {"poolRows", "dailyCapitalRows"}}])
     dataframe_to_csv_with_retry(pool_summary_df, checkpoint_dir / f"{trade_date}_pool_summary.csv", index=False)
     dataframe_to_csv_with_retry(daily_all_pool_df, checkpoint_dir / f"{trade_date}_all_pool_summary.csv", index=False)
+    dataframe_to_csv_with_retry(daily_capital_df, checkpoint_dir / f"{trade_date}_capital_summary.csv", index=False)
     dataframe_to_csv_with_retry(timing_df, checkpoint_dir / f"{trade_date}_timing.csv", index=False)
 
 
@@ -471,17 +619,19 @@ def _write_progress_status(output_root: Path, progress_rows: list[dict[str, Any]
     )
 
 
-def _read_date_checkpoint(combo_dir: Path, trade_date: str) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+def _read_date_checkpoint(combo_dir: Path, trade_date: str) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]] | None:
     checkpoint_dir = combo_dir / "daily_checkpoints"
     pool_summary_path = checkpoint_dir / f"{trade_date}_pool_summary.csv"
     timing_path = checkpoint_dir / f"{trade_date}_timing.csv"
-    if not pool_summary_path.exists() or not timing_path.exists():
+    capital_path = checkpoint_dir / f"{trade_date}_capital_summary.csv"
+    if not pool_summary_path.exists() or not timing_path.exists() or not capital_path.exists():
         return None
 
     pool_summary_df = pd.read_csv(pool_summary_path)
     timing_df = pd.read_csv(timing_path)
+    capital_df = pd.read_csv(capital_path)
     timing_row = timing_df.iloc[0].to_dict() if not timing_df.empty else {"tradeDate": trade_date, "status": "checkpoint"}
-    return pool_summary_df.to_dict(orient="records"), timing_row
+    return pool_summary_df.to_dict(orient="records"), timing_row, capital_df.to_dict(orient="records")
 
 
 def main() -> None:
@@ -595,6 +745,7 @@ def main() -> None:
 
         pool_rows: list[dict[str, Any]] = []
         timing_rows: list[dict[str, Any]] = []
+        daily_capital_rows: list[dict[str, Any]] = []
         tasks = [
             {
                 "tradeDate": trade_date,
@@ -619,9 +770,10 @@ def main() -> None:
                 if checkpoint is None:
                     pending_tasks.append(task)
                     continue
-                checkpoint_pool_rows, checkpoint_timing_row = checkpoint
+                checkpoint_pool_rows, checkpoint_timing_row, checkpoint_capital_rows = checkpoint
                 pool_rows.extend(checkpoint_pool_rows)
                 timing_rows.append(checkpoint_timing_row)
+                daily_capital_rows.extend(checkpoint_capital_rows)
                 progress_row["completedDateCount"] = len(timing_rows)
                 progress_row["latestTradeDate"] = trade_date
                 progress_row["latestWriteTime"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -637,7 +789,8 @@ def main() -> None:
                 date_pool_rows = result["poolRows"]
                 _write_date_checkpoint(combo_dir, result, date_pool_rows)
                 pool_rows.extend(date_pool_rows)
-                result = {key: value for key, value in result.items() if key != "poolRows"}
+                daily_capital_rows.extend(result.get("dailyCapitalRows", []))
+                result = {key: value for key, value in result.items() if key not in {"poolRows", "dailyCapitalRows"}}
                 timing_rows.append(result)
                 progress_row["completedDateCount"] = len(timing_rows)
                 progress_row["latestTradeDate"] = result["tradeDate"]
@@ -654,6 +807,7 @@ def main() -> None:
                 )
 
         pool_summary_df = pd.DataFrame(pool_rows)
+        daily_capital_df = pd.DataFrame(daily_capital_rows)
         date_timing_df = pd.DataFrame(timing_rows).sort_values("tradeDate").reset_index(drop=True)
         combo_elapsed = perf_counter() - combo_start
         combo_timing_row = {
@@ -677,6 +831,7 @@ def main() -> None:
             pool_summary_df=pool_summary_df,
             date_timing_df=date_timing_df,
             combo_timing_row=combo_timing_row,
+            daily_capital_df=daily_capital_df,
         )
         all_daily_summaries.append(daily_all_pool_df)
         all_total_summaries.append(total_all_dates_df.assign(comboTag=combo_tag))

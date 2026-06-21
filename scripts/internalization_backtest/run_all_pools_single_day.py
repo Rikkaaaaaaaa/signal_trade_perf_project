@@ -13,6 +13,7 @@ if str(SRC_DIR) not in sys.path:
 import pandas as pd
 
 from signal_trade_perf.internalization_backtest import BacktestParams, get_default_ims_roots, run_internalization_single_day
+from signal_trade_perf.internalization_capital import build_capital_event_rows, capital_metrics_by_variant
 from signal_trade_perf.source_backtest import dataframe_to_csv_with_retry, mkdir_with_retry
 
 
@@ -24,6 +25,9 @@ REPORT_VARIANT_ORDER = ["all", "lt1000", "lt2000", "liqcap5tick", "poscap_min5",
 CORE_METRIC_COLUMNS = [
     "totalTradeCount",
     "totalExecPnl",
+    "maxCapitalUsed",
+    "p95CapitalUsedByEvent",
+    "capitalAdjustedReturn",
     "clientAmtMatchRate",
     "notionalWeightedExecRet",
     "totalMatchedNotional",
@@ -54,11 +58,16 @@ def _print_core_metric_report(pool_name: str, trade_date: str, row: dict[str, ob
     print(f"variantTag: {row['variantTag']}")
     print(f"trades: {int(row['totalTradeCount'])}")
     for column in CORE_METRIC_COLUMNS[1:]:
-        print(f"{column}: {row[column]}")
+        if column in row:
+            print(f"{column}: {row[column]}")
 
 
-def _build_all_pool_core_summaries(all_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+def _build_all_pool_core_summaries(
+    all_rows: list[dict[str, object]],
+    daily_capital_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
     summary_df = pd.DataFrame(all_rows)
+    daily_capital_df = pd.DataFrame(daily_capital_rows)
     all_pool_rows: list[dict[str, object]] = []
     for variant_tag in REPORT_VARIANT_ORDER:
         variant_df = summary_df[summary_df["variantTag"] == variant_tag]
@@ -81,6 +90,15 @@ def _build_all_pool_core_summaries(all_rows: list[dict[str, object]]) -> list[di
                 "totalMatchedNotional": total_matched_notional,
             }
         )
+        if not daily_capital_df.empty:
+            capital_row_df = daily_capital_df[daily_capital_df["variantTag"] == variant_tag]
+            if not capital_row_df.empty:
+                max_capital_used = float(capital_row_df["maxCapitalUsed"].iloc[0])
+                all_pool_rows[-1]["maxCapitalUsed"] = max_capital_used
+                all_pool_rows[-1]["p95CapitalUsedByEvent"] = float(capital_row_df["p95CapitalUsedByEvent"].iloc[0])
+                all_pool_rows[-1]["capitalAdjustedReturn"] = (
+                    float("nan") if max_capital_used == 0 else total_exec_pnl / max_capital_used
+                )
     return all_pool_rows
 
 
@@ -112,6 +130,7 @@ def main() -> None:
     datetime_format = "%Y-%m-%d %H:%M:%S.%f"
     summary_frames: list[pd.DataFrame] = []
     core_metric_rows: list[dict[str, object]] = []
+    capital_event_rows: list[dict[str, object]] = []
     total_start = perf_counter()
 
     for idx, pool_name in enumerate(POOL_NAMES, start=1):
@@ -136,6 +155,13 @@ def main() -> None:
         dataframe_to_csv_with_retry(trades_df, pool_dir / "trades.csv", index=False, date_format=datetime_format)
         position_cap_trades_df = trades_df.attrs.get("position_cap_trades", pd.DataFrame())
         position_close_summary_df = trades_df.attrs.get("position_close_summaries", pd.DataFrame())
+        capital_event_rows.extend(
+            build_capital_event_rows(
+                trades_df=trades_df,
+                position_cap_trades_df=position_cap_trades_df,
+                variant_tags=REPORT_VARIANT_ORDER,
+            )
+        )
         if not position_cap_trades_df.empty:
             dataframe_to_csv_with_retry(
                 position_cap_trades_df,
@@ -174,7 +200,14 @@ def main() -> None:
         print("all_pool_summary skipped: no non-empty pool summaries.")
 
     if core_metric_rows:
-        for all_pool_row in _build_all_pool_core_summaries(core_metric_rows):
+        daily_capital_rows = capital_metrics_by_variant(
+            event_rows=capital_event_rows,
+            base_row={"tradeDate": args.date},
+            variant_tags=REPORT_VARIANT_ORDER,
+        )
+        daily_capital_df = pd.DataFrame(daily_capital_rows)
+        dataframe_to_csv_with_retry(daily_capital_df, result_dir / "daily_capital_summary.csv", index=False)
+        for all_pool_row in _build_all_pool_core_summaries(core_metric_rows, daily_capital_rows):
             _print_core_metric_report("ALL_POOLS", args.date, all_pool_row)
 
     total_elapsed = perf_counter() - total_start
