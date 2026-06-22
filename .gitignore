@@ -1,0 +1,16 @@
+venv/
+.idea/
+
+__pycache__/
+*.py[cod]
+
+cache/
+
+results/*
+!results/.gitkeep
+
+ims_backtest_data/*
+!ims_backtest_data/.gitkeep
+
+ims_backtest_data_plus/
+ims_backtest_data_smart/
