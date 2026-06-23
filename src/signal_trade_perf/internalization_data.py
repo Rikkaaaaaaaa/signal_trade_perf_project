@@ -203,10 +203,11 @@ def load_signal_day_for_internalization(
     pool_name: str,
     mysql_config: MysqlConfig | None = None,
     security_codes: list[str] | set[str] | None = None,
+    signal_table_name: str | None = None,
 ) -> pd.DataFrame:
     # internalization 链路直接使用 MySQL 原始 signal 时间，不再做 15s 聚合。
     mysql_config = mysql_config or MysqlConfig()
-    table_name = build_signal_table_name(pool_name)
+    table_name = signal_table_name or build_signal_table_name(pool_name)
     signal_df = load_signal_day_mysql(trade_date, table_name, mysql_config, security_codes=security_codes)
     if signal_df.empty:
         return signal_df

@@ -1976,6 +1976,7 @@ def load_internalization_day_inputs(
     mysql_config: MysqlConfig | None = None,
     ddb_config: DdbConfig | None = None,
     profile: bool = False,
+    signal_table_name: str | None = None,
 ) -> dict[str, object] | None:
     # Data here is independent of strategy parameters and can be cached per date/pool.
     mysql_config = mysql_config or MysqlConfig()
@@ -2010,6 +2011,7 @@ def load_internalization_day_inputs(
         pool_name=pool_name,
         mysql_config=mysql_config,
         security_codes=signal_filter_codes,
+        signal_table_name=signal_table_name,
     )
     record_stage("load_signal_mysql", stage_start, rowCount=len(signal_df), securityCount=len(signal_filter_codes))
     if signal_df.empty:
@@ -2190,6 +2192,7 @@ def run_internalization_single_day(
     ddb_config: DdbConfig | None = None,
     match_window_seconds: int | None = 10,
     profile: bool = False,
+    signal_table_name: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # 单日入口负责把数据源拼齐，然后分别跑不同 variant。
     prepared_inputs = load_internalization_day_inputs(
@@ -2199,6 +2202,7 @@ def run_internalization_single_day(
         mysql_config=mysql_config,
         ddb_config=ddb_config,
         profile=profile,
+        signal_table_name=signal_table_name,
     )
     if prepared_inputs is None:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
