@@ -186,7 +186,6 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
                     trade_date=trade_date,
                     ims_roots=[Path(path) for path in task["imsRoots"]],
                     pool_name=pool_name,
-                    signal_table=str(task["signalTable"]),
                 )
                 if prepared_inputs is not None and cache_mode in {"readwrite", "refresh"}:
                     _write_cached_inputs(cache_file, prepared_inputs)
@@ -346,7 +345,6 @@ def main() -> None:
     parser.add_argument("--signal-ranks-list", default="1,2", help='Semicolon-separated rank sets, e.g. "1,2;1;1,2,10".')
     parser.add_argument("--match-window-seconds-list", default="10")
     parser.add_argument("--spreads", default="0.01")
-    parser.add_argument("--signal-table", default="signal_hs300_low_price_70_pct")
     parser.add_argument("--ims-roots", default="")
     parser.add_argument("--output-root", default=str(PROJECT_ROOT / "results" / "internalization_backtest" / "low_price_param_sweep_date_mp"))
     parser.add_argument("--cache-mode", choices=["none", "readwrite", "refresh"], default="readwrite")
@@ -411,7 +409,6 @@ def main() -> None:
                 "signalRanks": signal_ranks,
                 "matchWindowSeconds": _match_window_value(match_window_seconds),
                 "spread": spread,
-                "signalTable": args.signal_table,
                 "imsRoots": [str(path) for path in ims_roots],
                 "cacheMode": args.cache_mode,
                 "cacheRoot": args.cache_root,

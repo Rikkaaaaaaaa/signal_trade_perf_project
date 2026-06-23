@@ -22,6 +22,11 @@ from .internalization_data import (
 LOW_PRICE_SIGNAL_TABLE = "signal_hs300_low_price_70_pct"
 
 
+def build_low_price_signal_table_name(pool_name: str) -> str:
+    # 低价股挂单 signal 表按股票池命名，例如 hs300 -> signal_hs300_low_price_70_pct。
+    return f"signal_{pool_name}_low_price_70_pct"
+
+
 def load_low_price_signal_day_mysql(
     trade_date: str,
     table_name: str = LOW_PRICE_SIGNAL_TABLE,
@@ -91,7 +96,7 @@ def load_low_price_day_inputs(
     ims_roots: list[Path | str],
     pool_name: str = "hs300",
     mysql_config: MysqlConfig | None = None,
-    signal_table: str = LOW_PRICE_SIGNAL_TABLE,
+    signal_table: str | None = None,
 ) -> dict[str, object] | None:
     # 单日 prepared inputs 只放“和参数无关”的数据，方便多参数扫参时按 date/pool 缓存。
     # 这里先用 pool universe ∩ IMS 目录 ticker 缩小 signal 查询范围。
@@ -104,7 +109,7 @@ def load_low_price_day_inputs(
 
     signal_df = load_low_price_signal_day_mysql(
         trade_date=trade_date,
-        table_name=signal_table,
+        table_name=signal_table or build_low_price_signal_table_name(pool_name),
         mysql_config=mysql_config,
         security_codes=security_codes,
     )
