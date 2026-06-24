@@ -163,6 +163,8 @@ def _empty_result(trade_date: str, params: BacktestParams, match_window_seconds:
         "cacheWrites": 0,
         "poolRows": [],
         "dailyCapitalRows": [],
+        "orderEventRows": [],
+        "tradeRows": [],
     }
 
 
@@ -183,6 +185,13 @@ def _write_cached_inputs(path: Path, prepared_inputs: dict[str, object]) -> None
     with gzip.open(tmp_path, "wb") as file:
         pickle.dump(prepared_inputs, file, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp_path, path)
+
+
+def _cached_inputs_missing_close_prices(prepared_inputs: dict[str, object] | None) -> bool:
+    if not prepared_inputs:
+        return False
+    close_price_map = prepared_inputs.get("closePriceMap")
+    return isinstance(close_price_map, dict) and len(close_price_map) == 0
 
 
 def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
@@ -208,6 +217,8 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
     pool_rows: list[dict[str, Any]] = []
     skipped_pools: list[str] = []
     capital_event_rows: list[dict[str, Any]] = []
+    order_event_rows: list[dict[str, Any]] = []
+    trade_rows: list[dict[str, Any]] = []
     cache_hits = 0
     cache_misses = 0
     cache_writes = 0
@@ -220,7 +231,9 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
             cache_file = _cache_path(cache_root, trade_date, pool_name)
             if cache_mode != "none" and cache_mode != "refresh":
                 prepared_inputs = _load_cached_inputs(cache_file)
-                if prepared_inputs is not None:
+                if _cached_inputs_missing_close_prices(prepared_inputs):
+                    prepared_inputs = None
+                elif prepared_inputs is not None:
                     cache_hits += 1
 
             if prepared_inputs is None:
@@ -239,7 +252,7 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
                 skipped_pools.append(pool_name)
                 continue
 
-            _, trades_df, _, pool_summary_df = run_internalization_prepared_day(
+            order_events_df, trades_df, _, pool_summary_df = run_internalization_prepared_day(
                 prepared_inputs=prepared_inputs,
                 params=params,
                 match_window_seconds=match_window_seconds,
@@ -263,6 +276,10 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
                     variant_tags=VARIANT_ORDER,
                 )
             )
+            if not order_events_df.empty:
+                order_event_rows.extend(order_events_df.to_dict(orient="records"))
+            if not trades_df.empty:
+                trade_rows.extend(trades_df.to_dict(orient="records"))
 
         daily_capital_rows = capital_metrics_by_variant(
             event_rows=capital_event_rows,
@@ -296,6 +313,8 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
             "cacheWrites": cache_writes,
             "poolRows": pool_rows,
             "dailyCapitalRows": daily_capital_rows,
+            "orderEventRows": order_event_rows,
+            "tradeRows": trade_rows,
         }
     except Exception:
         return _empty_result(
@@ -749,6 +768,8 @@ def main() -> None:
         pool_rows: list[dict[str, Any]] = []
         timing_rows: list[dict[str, Any]] = []
         daily_capital_rows: list[dict[str, Any]] = []
+        order_event_rows: list[dict[str, Any]] = []
+        trade_rows: list[dict[str, Any]] = []
         tasks = [
             {
                 "tradeDate": trade_date,
@@ -793,7 +814,9 @@ def main() -> None:
                 _write_date_checkpoint(combo_dir, result, date_pool_rows)
                 pool_rows.extend(date_pool_rows)
                 daily_capital_rows.extend(result.get("dailyCapitalRows", []))
-                result = {key: value for key, value in result.items() if key not in {"poolRows", "dailyCapitalRows"}}
+                order_event_rows.extend(result.get("orderEventRows", []))
+                trade_rows.extend(result.get("tradeRows", []))
+                result = {key: value for key, value in result.items() if key not in {"poolRows", "dailyCapitalRows", "orderEventRows", "tradeRows"}}
                 timing_rows.append(result)
                 progress_row["completedDateCount"] = len(timing_rows)
                 progress_row["latestTradeDate"] = result["tradeDate"]
@@ -811,6 +834,8 @@ def main() -> None:
 
         pool_summary_df = pd.DataFrame(pool_rows)
         daily_capital_df = pd.DataFrame(daily_capital_rows)
+        order_event_df = pd.DataFrame(order_event_rows)
+        trades_df = pd.DataFrame(trade_rows)
         date_timing_df = pd.DataFrame(timing_rows).sort_values("tradeDate").reset_index(drop=True)
         combo_elapsed = perf_counter() - combo_start
         combo_timing_row = {
@@ -836,6 +861,8 @@ def main() -> None:
             combo_timing_row=combo_timing_row,
             daily_capital_df=daily_capital_df,
         )
+        dataframe_to_csv_with_retry(order_event_df, combo_dir / "order_events.csv", index=False)
+        dataframe_to_csv_with_retry(trades_df, combo_dir / "trades.csv", index=False)
         all_daily_summaries.append(daily_all_pool_df)
         all_total_summaries.append(total_all_dates_df.assign(comboTag=combo_tag))
         all_combo_timing_rows.append(combo_timing_row)

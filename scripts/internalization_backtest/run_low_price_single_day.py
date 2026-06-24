@@ -60,7 +60,6 @@ def main() -> None:
     parser.add_argument("--signal-rank-threshold", type=int, default=2, help="Backward compatible shorthand for 1..N when --signal-ranks is empty.")
     parser.add_argument("--match-window-seconds", default="10")
     parser.add_argument("--spread", type=float, default=0.01)
-    parser.add_argument("--signal-table", default="signal_hs300_low_price_70_pct")
     parser.add_argument("--output-root", default=str(PROJECT_ROOT / "results" / "internalization_backtest" / "low_price_single_day"))
     args = parser.parse_args()
 
@@ -85,7 +84,6 @@ def main() -> None:
         params=params,
         ims_roots=get_default_ims_roots(PROJECT_ROOT),
         pool_name=args.pool,
-        signal_table=args.signal_table,
     )
 
     datetime_format = "%Y-%m-%d %H:%M:%S.%f"

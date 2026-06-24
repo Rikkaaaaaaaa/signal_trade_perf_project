@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 import pymysql
 
-from .configs import MysqlConfig
+from .configs import MysqlConfig, build_low_price_signal_table_name
 from .internalization_data import (
     discover_ims_security_codes,
     load_ims_child_orders,
@@ -19,17 +19,12 @@ from .internalization_data import (
 # - bs_flag=b/s 表示挂买/挂卖方向；
 # - merge_signal=1/2 或 -1/-2 表示成交概率 rank；
 # - y_test=1/0 是事后真实是否成交，用于直接估算挂单 PnL。
-LOW_PRICE_SIGNAL_TABLE = "signal_hs300_low_price_70_pct"
 
-
-def build_low_price_signal_table_name(pool_name: str) -> str:
-    # 低价股挂单 signal 表按股票池命名，例如 hs300 -> signal_hs300_low_price_70_pct。
-    return f"signal_{pool_name}_low_price_70_pct"
 
 
 def load_low_price_signal_day_mysql(
     trade_date: str,
-    table_name: str = LOW_PRICE_SIGNAL_TABLE,
+    table_name: str,
     mysql_config: MysqlConfig | None = None,
     security_codes: list[str] | set[str] | None = None,
 ) -> pd.DataFrame:

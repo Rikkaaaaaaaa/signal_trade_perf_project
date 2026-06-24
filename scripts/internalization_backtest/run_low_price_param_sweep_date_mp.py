@@ -151,6 +151,8 @@ def _empty_result(trade_date: str, params: LowPriceBacktestParams, elapsed: floa
         "cacheWrites": 0,
         "skippedPools": "",
         "summaryRows": [],
+        "orderEventRows": [],
+        "tradeRows": [],
     }
 
 
@@ -167,6 +169,8 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
     cache_misses = 0
     cache_writes = 0
     summary_rows: list[dict[str, Any]] = []
+    order_event_rows: list[dict[str, Any]] = []
+    trade_rows: list[dict[str, Any]] = []
     skipped_pools: list[str] = []
     try:
         cache_mode = str(task["cacheMode"])
@@ -195,7 +199,7 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
                 skipped_pools.append(pool_name)
                 continue
 
-            _, _, summary_df = run_low_price_prepared_day(prepared_inputs=prepared_inputs, params=params)
+            events_df, trades_df, summary_df = run_low_price_prepared_day(prepared_inputs=prepared_inputs, params=params)
             pool_summary_rows = summary_df.to_dict(orient="records") if not summary_df.empty else []
             if not pool_summary_rows:
                 skipped_pools.append(pool_name)
@@ -205,6 +209,10 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
                 row["tradeDate"] = trade_date
                 row["poolName"] = pool_name
             summary_rows.extend(pool_summary_rows)
+            if not events_df.empty:
+                order_event_rows.extend(events_df.to_dict(orient="records"))
+            if not trades_df.empty:
+                trade_rows.extend(trades_df.to_dict(orient="records"))
 
         status = "ok" if summary_rows else "skipped_empty_result"
         return {
@@ -220,6 +228,8 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
             "cacheWrites": cache_writes,
             "skippedPools": ",".join(skipped_pools),
             "summaryRows": summary_rows,
+            "orderEventRows": order_event_rows,
+            "tradeRows": trade_rows,
         }
     except Exception:
         return _empty_result(trade_date=trade_date, params=params, elapsed=perf_counter() - start, error=traceback.format_exc())
@@ -401,6 +411,8 @@ def main() -> None:
         _write_progress_status(output_root, progress_rows)
 
         summary_rows: list[dict[str, Any]] = []
+        order_event_rows: list[dict[str, Any]] = []
+        trade_rows: list[dict[str, Any]] = []
         timing_rows: list[dict[str, Any]] = []
         tasks = [
             {
@@ -437,7 +449,9 @@ def main() -> None:
             for result in pool.imap_unordered(_run_one_date, tasks):
                 _write_date_checkpoint(combo_dir, result)
                 summary_rows.extend(result.get("summaryRows", []))
-                timing_row = {key: value for key, value in result.items() if key != "summaryRows"}
+                order_event_rows.extend(result.get("orderEventRows", []))
+                trade_rows.extend(result.get("tradeRows", []))
+                timing_row = {key: value for key, value in result.items() if key not in {"summaryRows", "orderEventRows", "tradeRows"}}
                 timing_rows.append(timing_row)
                 progress_row["completedDateCount"] = len(timing_rows)
                 progress_row["latestTradeDate"] = result["tradeDate"]
@@ -450,6 +464,8 @@ def main() -> None:
                 )
 
         daily_df = pd.DataFrame(summary_rows)
+        order_event_df = pd.DataFrame(order_event_rows)
+        trades_df = pd.DataFrame(trade_rows)
         timing_df = pd.DataFrame(timing_rows).sort_values("tradeDate").reset_index(drop=True) if timing_rows else pd.DataFrame()
         total_df = _aggregate_total(daily_df)
         combo_elapsed = perf_counter() - combo_start
@@ -464,6 +480,8 @@ def main() -> None:
             "elapsedSeconds": combo_elapsed,
         }
         dataframe_to_csv_with_retry(daily_df, combo_dir / "daily_summary.csv", index=False)
+        dataframe_to_csv_with_retry(order_event_df, combo_dir / "order_events.csv", index=False)
+        dataframe_to_csv_with_retry(trades_df, combo_dir / "trades.csv", index=False)
         dataframe_to_csv_with_retry(total_df, combo_dir / "total_summary.csv", index=False)
         dataframe_to_csv_with_retry(timing_df, combo_dir / "date_timing.csv", index=False)
         dataframe_to_csv_with_retry(pd.DataFrame([combo_timing_row]), combo_dir / "combo_timing.csv", index=False)

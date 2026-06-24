@@ -55,6 +55,32 @@ def _eligible_signal_mask(signal_df: pd.DataFrame, client_side: str, ranks: tupl
     return signal_df["bsFlag"].eq("b") & signal_df["mergeSignal"].abs().isin(rank_values) & signal_df["mergeSignal"].gt(0)
 
 
+def _find_latest_eligible_signal_row(
+    sec_signal_df: pd.DataFrame,
+    order_time: pd.Timestamp,
+    client_side: str,
+    params: LowPriceBacktestParams,
+) -> tuple[pd.Series | None, int]:
+    # 低价股同一个 15s bar 有 b/s 两行；先定位最近 bar，再在这个 bar 内找客户方向对应的 signal。
+    if sec_signal_df.empty:
+        return None, -1
+    signal_times = sec_signal_df["barTime"].drop_duplicates().to_numpy(dtype="datetime64[ns]")
+    matched_pos = int(signal_times.searchsorted(order_time.to_datetime64(), side="right") - 1)
+    if matched_pos < 0:
+        return None, -1
+
+    matched_time = pd.Timestamp(signal_times[matched_pos])
+    if matched_time < _match_window_start(order_time, params.match_window_seconds):
+        return None, -1
+
+    same_bar_df = sec_signal_df[sec_signal_df["barTime"].eq(matched_time)]
+    eligible_df = same_bar_df[_eligible_signal_mask(same_bar_df, client_side, params.signal_ranks)]
+    if eligible_df.empty:
+        return None, -1
+    matched_row = eligible_df.iloc[0]
+    return matched_row, int(matched_row.name)
+
+
 def _merge_tick_to_signal(sec_signal_df: pd.DataFrame, tick_df: pd.DataFrame) -> pd.DataFrame:
     # 给每个 signal bar 回填“这个 bar 之前最近一个 tick”的盘口价量。
     # direction="backward" 保证不会偷看到 signal 之后的 tick。
@@ -88,21 +114,21 @@ def _merge_tick_to_signal(sec_signal_df: pd.DataFrame, tick_df: pd.DataFrame) ->
 
 
 def _merge_tick_to_orders(matched_order_df: pd.DataFrame, tick_df: pd.DataFrame) -> pd.DataFrame:
-    # 客户单开仓价用客户单到达前最新 tick mid，同样用 backward asof 防止取到未来 tick。
+    # 客户单开仓价和挂单价都用客户单到达前最新 tick，同样用 backward asof 防止取到未来 tick。
     if matched_order_df.empty:
         return matched_order_df
     if tick_df.empty:
-        return matched_order_df.assign(openMid=np.nan, openTickTime=pd.NaT)
+        return matched_order_df.assign(openMid=np.nan, openBidPrice1=np.nan, openAskPrice1=np.nan, openTickTime=pd.NaT)
 
     left_df = matched_order_df.sort_values("clientOrderTime").reset_index(drop=True)
     right_df = (
-        tick_df[["tickTime", "midPriceTick"]]
+        tick_df[["tickTime", "midPriceTick", "bidPrice1Tick", "askPrice1Tick"]]
         .dropna(subset=["tickTime"])
         .sort_values("tickTime")
         .reset_index(drop=True)
     )
     if right_df.empty:
-        return matched_order_df.assign(openMid=np.nan, openTickTime=pd.NaT)
+        return matched_order_df.assign(openMid=np.nan, openBidPrice1=np.nan, openAskPrice1=np.nan, openTickTime=pd.NaT)
     enriched_df = pd.merge_asof(
         left_df,
         right_df,
@@ -110,7 +136,14 @@ def _merge_tick_to_orders(matched_order_df: pd.DataFrame, tick_df: pd.DataFrame)
         right_on="tickTime",
         direction="backward",
     )
-    return enriched_df.rename(columns={"midPriceTick": "openMid", "tickTime": "openTickTime"})
+    return enriched_df.rename(
+        columns={
+            "midPriceTick": "openMid",
+            "bidPrice1Tick": "openBidPrice1",
+            "askPrice1Tick": "openAskPrice1",
+            "tickTime": "openTickTime",
+        }
+    )
 
 
 def _cap_qty(row: pd.Series, variant_tag: str) -> int:
@@ -127,6 +160,166 @@ def _cap_qty(row: pd.Series, variant_tag: str) -> int:
     if variant_tag == "lowcap_avg5_075":
         return max(0, int(np.floor(0.75 * ((avg_bid + avg_ask) / 2.0))))
     raise ValueError(f"Unknown low-price variant: {variant_tag}")
+
+
+def _next_price_move_indices(values: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    # 对每个 signal bar 预计算“未来第一次价格上移/下移”的行号，后续逐笔查表即可 O(1)。
+    arr = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+    n = len(arr)
+    next_up = np.full(n, -1, dtype=int)
+    next_down = np.full(n, -1, dtype=int)
+    for idx in range(n):
+        current = arr[idx]
+        if np.isnan(current):
+            continue
+        for future_idx in range(idx + 1, n):
+            future = arr[future_idx]
+            if np.isnan(future) or future == current:
+                continue
+            if future > current:
+                next_up[idx] = future_idx
+            else:
+                next_down[idx] = future_idx
+            break
+    return next_up, next_down
+
+
+def _add_next_price_move_cols(sec_signal_df: pd.DataFrame) -> pd.DataFrame:
+    # 价格路径 PnL 只关心第一个一档价格变化点：LONG 看 ask1，SHORT 看 bid1。
+    if sec_signal_df.empty:
+        return sec_signal_df
+    result_df = sec_signal_df.copy()
+    result_df["nextAskUpIdx"], result_df["nextAskDownIdx"] = _next_price_move_indices(result_df["askPrice1Tick"])
+    result_df["nextBidUpIdx"], result_df["nextBidDownIdx"] = _next_price_move_indices(result_df["bidPrice1Tick"])
+    return result_df
+
+
+def _log_price_path_fallback(message: str) -> None:
+    # y_test=0 但价格先向有利方向变化时，说明标签可能偏保守；同时打印和落日志方便复盘。
+    print(message)
+    log_path = Path.cwd() / "results" / "internalization_backtest" / "logs" / "low_price_price_path_fallback.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as file:
+            file.write(f"{pd.Timestamp.now():%Y-%m-%d %H:%M:%S} {message}\n")
+    except OSError:
+        pass
+
+
+def _low_price_price_path_pnl(
+    sec_signal_df: pd.DataFrame,
+    signal_idx: int,
+    signal_row: pd.Series,
+    side: str,
+    open_mid: float,
+    posted_price: float,
+    y_test: int,
+    params: LowPriceBacktestParams,
+    context: dict[str, object],
+) -> dict[str, object]:
+    # B 版真实价格路径 PnL：开仓挂单价取客户到达前最新 tick，后续仍用 signal 序列判断价格路径。
+    # 这里只改变 PnL 和 pnlSettleTime，不改变低价股容量 reset/资金占用释放口径。
+    signal_time = pd.Timestamp(signal_row.barTime)
+    posted_price = float(posted_price) if not pd.isna(posted_price) else np.nan
+    old_penalty = -2.0 * float(params.spread)
+
+    if pd.isna(posted_price):
+        return {
+            "pnlPerShare": old_penalty if int(y_test) == 0 else np.nan,
+            "pnlSettleTime": signal_time,
+            "postedPrice": np.nan,
+            "pricePathClosePrice": np.nan,
+            "pnlModel": "price_path_missing_posted_price",
+            "pricePathReason": "missing_posted_price",
+        }
+
+    if int(y_test) == 1:
+        pnl_per_share = (posted_price - open_mid) if side == "LONG" else (open_mid - posted_price)
+        return {
+            "pnlPerShare": pnl_per_share,
+            "pnlSettleTime": signal_time,
+            "postedPrice": posted_price,
+            "pricePathClosePrice": posted_price,
+            "pnlModel": "price_path_y_test_fill",
+            "pricePathReason": "y_test_1",
+        }
+
+    if side == "LONG":
+        next_up_idx = int(signal_row.get("nextAskUpIdx", -1))
+        next_down_idx = int(signal_row.get("nextAskDownIdx", -1))
+        if next_up_idx >= 0:
+            future_row = sec_signal_df.iloc[next_up_idx]
+            future_time = pd.Timestamp(future_row.barTime)
+            message = (
+                "[low_price_price_path_fallback] "
+                f"tradeDate={context.get('tradeDate')} pool={context.get('poolName')} security={context.get('securityCode')} "
+                f"side={side} signalTime={context.get('signalTime')} postedPrice={posted_price} futureTime={future_time} "
+                f"reason=y_test0_but_ask_up_first"
+            )
+            _log_price_path_fallback(message)
+            return {
+                "pnlPerShare": posted_price - open_mid,
+                "pnlSettleTime": future_time,
+                "postedPrice": posted_price,
+                "pricePathClosePrice": posted_price,
+                "pnlModel": "price_path_y_test0_favorable_fill",
+                "pricePathReason": "ask_up_before_ask_down",
+            }
+        if next_down_idx >= 0:
+            future_row = sec_signal_df.iloc[next_down_idx]
+            future_time = pd.Timestamp(future_row.barTime)
+            bid_t = float(future_row.get("bidPrice1Tick", np.nan)) if not pd.isna(future_row.get("bidPrice1Tick", np.nan)) else np.nan
+            return {
+                "pnlPerShare": (bid_t - open_mid) if not pd.isna(bid_t) else old_penalty,
+                "pnlSettleTime": future_time,
+                "postedPrice": posted_price,
+                "pricePathClosePrice": bid_t,
+                "pnlModel": "price_path_y_test0_adverse_close",
+                "pricePathReason": "ask_down_first",
+            }
+    else:
+        next_down_idx = int(signal_row.get("nextBidDownIdx", -1))
+        next_up_idx = int(signal_row.get("nextBidUpIdx", -1))
+        if next_down_idx >= 0:
+            future_row = sec_signal_df.iloc[next_down_idx]
+            future_time = pd.Timestamp(future_row.barTime)
+            message = (
+                "[low_price_price_path_fallback] "
+                f"tradeDate={context.get('tradeDate')} pool={context.get('poolName')} security={context.get('securityCode')} "
+                f"side={side} signalTime={context.get('signalTime')} postedPrice={posted_price} futureTime={future_time} "
+                f"reason=y_test0_but_bid_down_first"
+            )
+            _log_price_path_fallback(message)
+            return {
+                "pnlPerShare": open_mid - posted_price,
+                "pnlSettleTime": future_time,
+                "postedPrice": posted_price,
+                "pricePathClosePrice": posted_price,
+                "pnlModel": "price_path_y_test0_favorable_fill",
+                "pricePathReason": "bid_down_before_bid_up",
+            }
+        if next_up_idx >= 0:
+            future_row = sec_signal_df.iloc[next_up_idx]
+            future_time = pd.Timestamp(future_row.barTime)
+            ask_t = float(future_row.get("askPrice1Tick", np.nan)) if not pd.isna(future_row.get("askPrice1Tick", np.nan)) else np.nan
+            return {
+                "pnlPerShare": (open_mid - ask_t) if not pd.isna(ask_t) else old_penalty,
+                "pnlSettleTime": future_time,
+                "postedPrice": posted_price,
+                "pricePathClosePrice": ask_t,
+                "pnlModel": "price_path_y_test0_adverse_close",
+                "pricePathReason": "bid_up_first",
+            }
+
+    eod_time = pd.Timestamp(sec_signal_df.iloc[-1].barTime) if not sec_signal_df.empty else signal_time
+    return {
+        "pnlPerShare": old_penalty,
+        "pnlSettleTime": eod_time,
+        "postedPrice": posted_price,
+        "pricePathClosePrice": np.nan,
+        "pnlModel": "price_path_no_move_spread_penalty",
+        "pricePathReason": "no_price_move_before_eod",
+    }
 
 
 def _empty_summary(pool_name: str, trade_date: str, variant_tag: str, params: LowPriceBacktestParams) -> dict[str, Any]:
@@ -218,17 +411,12 @@ def _simulate_security_variant(
                 continue
 
             order_time = pd.Timestamp(order["clientOrderTime"])
-            eligible_df = sec_signal_df[_eligible_signal_mask(sec_signal_df, client_side, params.signal_ranks)]
-            eligible_times = eligible_df["barTime"].to_numpy(dtype="datetime64[ns]")
-            matched_pos = int(eligible_times.searchsorted(order_time.to_datetime64(), side="right") - 1)
-            matched_row = None
-            matched_idx = -1
-            if matched_pos >= 0:
-                probe_row = eligible_df.iloc[matched_pos]
-                if probe_row.barTime >= _match_window_start(order_time, params.match_window_seconds):
-                    if bool(_eligible_signal_mask(pd.DataFrame([probe_row]), client_side, params.signal_ranks).iloc[0]):
-                        matched_row = probe_row
-                        matched_idx = int(probe_row.name)
+            matched_row, matched_idx = _find_latest_eligible_signal_row(
+                sec_signal_df=sec_signal_df,
+                order_time=order_time,
+                client_side=client_side,
+                params=params,
+            )
 
             if matched_row is None:
                 event_rows.append({**order, "variantTag": variant_tag, "matched": False, "matchStatus": "no_eligible_signal"})
@@ -307,8 +495,24 @@ def _simulate_security_variant(
                 continue
 
             open_mid = float(order["openMid"])
-            # 简化假设：成交赚 0.5 * spread，未成交亏 2.0 * spread；收益率再除以 openMid。
-            pnl_per_share = params.spread * (0.5 if int(order["yTest"]) == 1 else -2.0)
+            posted_price = order.get("openAskPrice1") if side == "LONG" else order.get("openBidPrice1")
+            price_path = _low_price_price_path_pnl(
+                sec_signal_df=sec_signal_df,
+                signal_idx=int(idx),
+                signal_row=signal_row,
+                side=side,
+                open_mid=open_mid,
+                posted_price=posted_price,
+                y_test=int(order["yTest"]),
+                params=params,
+                context={
+                    "tradeDate": trade_date,
+                    "poolName": pool_name,
+                    "securityCode": security_code,
+                    "signalTime": int(order["matchSignalTimeInt"]),
+                },
+            )
+            pnl_per_share = float(price_path["pnlPerShare"])
             client_filled_amt = float(order["clientFilledAmt"]) * exec_qty / original_qty if original_qty > 0 else 0.0
             trade_row = {
                 "poolName": pool_name,
@@ -324,7 +528,7 @@ def _simulate_security_variant(
                 "openTime": order["clientOrderTime"],
                 "openTickTime": order.get("openTickTime", pd.NaT),
                 "closeTime": pd.NaT,
-                "pnlSettleTime": order["matchSignalTime"],
+                "pnlSettleTime": price_path["pnlSettleTime"],
                 "openSignalTime": int(order["matchSignalTimeInt"]),
                 "bsFlag": order["bsFlag"],
                 "mergeSignal": float(order["mergeSignal"]),
@@ -333,7 +537,13 @@ def _simulate_security_variant(
                 "clientQty": exec_qty,
                 "clientFilledAmt": client_filled_amt,
                 "openMid": open_mid,
+                "openBidPrice1": order.get("openBidPrice1", np.nan),
+                "openAskPrice1": order.get("openAskPrice1", np.nan),
                 "spread": params.spread,
+                "postedPrice": price_path["postedPrice"],
+                "pricePathClosePrice": price_path["pricePathClosePrice"],
+                "pnlModel": price_path["pnlModel"],
+                "pricePathReason": price_path["pricePathReason"],
                 "pnlPerShare": pnl_per_share,
                 "execRet": pnl_per_share / open_mid if open_mid else np.nan,
                 "execPnl": pnl_per_share * exec_qty,
@@ -375,8 +585,8 @@ def _match_orders_to_signals(
     variant_tag: str,
     params: LowPriceBacktestParams,
 ) -> list[dict[str, Any]]:
-    # 先按客户方向找“客户单到达前最近的 eligible signal”，再统一回填 openMid。
-    # 这样三组 cap variant 可以共用同一批方向/时间匹配结果。
+    # 只看客户单到达前最近一条 signal，再判断它是否符合方向/rank 和 match window。
+    # 不能往前翻历史 eligible signal；否则 unlimited 会变成“历史上曾经出现过即可匹配”。
     event_rows: list[dict[str, Any]] = []
     for order in sec_order_df.to_dict(orient="records"):
         client_side = str(order["clientSide"]).upper()
@@ -384,16 +594,12 @@ def _match_orders_to_signals(
             continue
 
         order_time = pd.Timestamp(order["clientOrderTime"])
-        eligible_df = sec_signal_df[_eligible_signal_mask(sec_signal_df, client_side, params.signal_ranks)]
-        eligible_times = eligible_df["barTime"].to_numpy(dtype="datetime64[ns]")
-        matched_pos = int(eligible_times.searchsorted(order_time.to_datetime64(), side="right") - 1)
-        matched_row = None
-        matched_idx = -1
-        if matched_pos >= 0:
-            probe_row = eligible_df.iloc[matched_pos]
-            if probe_row.barTime >= _match_window_start(order_time, params.match_window_seconds):
-                matched_row = probe_row
-                matched_idx = int(probe_row.name)
+        matched_row, matched_idx = _find_latest_eligible_signal_row(
+            sec_signal_df=sec_signal_df,
+            order_time=order_time,
+            client_side=client_side,
+            params=params,
+        )
 
         if matched_row is None:
             event_rows.append({**order, "variantTag": variant_tag, "matched": False, "matchStatus": "no_eligible_signal"})
@@ -446,7 +652,7 @@ def run_low_price_prepared_day(
     try:
         for security_code in security_codes:
             tick_df = tick_cache.get(security_code)
-            sec_signal_df = _merge_tick_to_signal(signal_by_security[security_code], tick_df)
+            sec_signal_df = _add_next_price_move_cols(_merge_tick_to_signal(signal_by_security[security_code], tick_df))
             sec_order_df = orders_by_security[security_code]
             for variant_tag in LOW_PRICE_VARIANTS:
                 raw_events = _match_orders_to_signals(
@@ -468,7 +674,7 @@ def run_low_price_prepared_day(
                             **{
                                 key: value
                                 for key, value in matched_by_id.get((row["variantTag"], row["clientOrderId"], row["clientOrderTime"]), {}).items()
-                                if key in {"openMid", "openTickTime"}
+                                if key in {"openMid", "openTickTime", "openBidPrice1", "openAskPrice1"}
                             },
                         }
                         for row in raw_events
@@ -526,7 +732,7 @@ def run_low_price_single_day(
     pool_name: str = "hs300",
     mysql_config: MysqlConfig | None = None,
     ddb_config: DdbConfig | None = None,
-    signal_table: str = "signal_hs300_low_price_70_pct",
+    signal_table: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # 单日调试入口，方便先看某一天/某个 pool 的 order_events、trades、summary 明细。
     roots = ims_roots if ims_roots is not None else get_default_ims_roots(Path.cwd())

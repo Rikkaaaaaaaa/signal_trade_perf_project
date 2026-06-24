@@ -28,6 +28,14 @@ def build_signal_table_name(pool_name: str) -> str:
     return f"ensemble_signal_{pool_name}_highprice_lgbm_batch3_pct2_mix_am_pm"
 
 
+def build_low_price_signal_table_name(pool_name: str) -> str:
+    return f"signal_{pool_name}_low_price_70_pct"
+
+
+def build_high_price_fill_rate_signal_table_name(pool_name: str) -> str:
+    return f"signal_{pool_name}_high_price_70_pct_all"
+
+
 def get_pool_name(table_name: str) -> str:
     return table_name.removeprefix("ensemble_signal_").removesuffix("_highprice_lgbm_batch3_pct2_mix_am_pm")
 
