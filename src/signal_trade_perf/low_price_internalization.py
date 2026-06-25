@@ -10,7 +10,7 @@ import pandas as pd
 from .configs import DdbConfig, MysqlConfig
 from .internalization import TickMidCache
 from .internalization_capital import build_capital_event_rows, capital_metrics_by_variant
-from .internalization_data import get_default_ims_roots
+from .internalization_data import get_default_ims_roots, load_aligned_price_df
 from .low_price_internalization_data import load_low_price_day_inputs
 
 
@@ -146,6 +146,21 @@ def _merge_tick_to_orders(matched_order_df: pd.DataFrame, tick_df: pd.DataFrame)
     )
 
 
+def _merge_aligned_to_signal(sec_signal_df: pd.DataFrame, aligned_price_df: pd.DataFrame) -> pd.DataFrame:
+    # ?????? tick ????????????????? signal ?????? Prices_* ???
+    if sec_signal_df.empty:
+        return sec_signal_df
+    if aligned_price_df.empty:
+        return sec_signal_df.assign(
+            closeMidAligned=np.nan,
+            closeAsk1Aligned=np.nan,
+            closeBid1Aligned=np.nan,
+        )
+
+    right_df = aligned_price_df[["securityCode", "barTime", "closeMidAligned", "closeAsk1Aligned", "closeBid1Aligned"]]
+    return sec_signal_df.merge(right_df, on=["securityCode", "barTime"], how="left")
+
+
 def _cap_qty(row: pd.Series, variant_tag: str) -> int:
     # 低价股不希望在盘口挂出过大量，所以容量按一档量滚动均值限制。
     # 这里返回的是同一价格周期内、同一敞口方向允许累计打开的最大股数。
@@ -185,12 +200,14 @@ def _next_price_move_indices(values: pd.Series) -> tuple[np.ndarray, np.ndarray]
 
 
 def _add_next_price_move_cols(sec_signal_df: pd.DataFrame) -> pd.DataFrame:
-    # 价格路径 PnL 只关心第一个一档价格变化点：LONG 看 ask1，SHORT 看 bid1。
+    # ???? PnL ??????????????LONG ? ask1?SHORT ? bid1?
     if sec_signal_df.empty:
         return sec_signal_df
     result_df = sec_signal_df.copy()
-    result_df["nextAskUpIdx"], result_df["nextAskDownIdx"] = _next_price_move_indices(result_df["askPrice1Tick"])
-    result_df["nextBidUpIdx"], result_df["nextBidDownIdx"] = _next_price_move_indices(result_df["bidPrice1Tick"])
+    ask_series = result_df["closeAsk1Aligned"].where(result_df["closeAsk1Aligned"].notna(), result_df["askPrice1Tick"])
+    bid_series = result_df["closeBid1Aligned"].where(result_df["closeBid1Aligned"].notna(), result_df["bidPrice1Tick"])
+    result_df["nextAskUpIdx"], result_df["nextAskDownIdx"] = _next_price_move_indices(ask_series)
+    result_df["nextBidUpIdx"], result_df["nextBidDownIdx"] = _next_price_move_indices(bid_series)
     return result_df
 
 
@@ -268,7 +285,10 @@ def _low_price_price_path_pnl(
         if next_down_idx >= 0:
             future_row = sec_signal_df.iloc[next_down_idx]
             future_time = pd.Timestamp(future_row.barTime)
-            bid_t = float(future_row.get("bidPrice1Tick", np.nan)) if not pd.isna(future_row.get("bidPrice1Tick", np.nan)) else np.nan
+            bid_t = future_row.get("closeBid1Aligned", np.nan)
+            if pd.isna(bid_t):
+                bid_t = future_row.get("bidPrice1Tick", np.nan)
+            bid_t = float(bid_t) if not pd.isna(bid_t) else np.nan
             return {
                 "pnlPerShare": (bid_t - open_mid) if not pd.isna(bid_t) else old_penalty,
                 "pnlSettleTime": future_time,
@@ -301,7 +321,10 @@ def _low_price_price_path_pnl(
         if next_up_idx >= 0:
             future_row = sec_signal_df.iloc[next_up_idx]
             future_time = pd.Timestamp(future_row.barTime)
-            ask_t = float(future_row.get("askPrice1Tick", np.nan)) if not pd.isna(future_row.get("askPrice1Tick", np.nan)) else np.nan
+            ask_t = future_row.get("closeAsk1Aligned", np.nan)
+            if pd.isna(ask_t):
+                ask_t = future_row.get("askPrice1Tick", np.nan)
+            ask_t = float(ask_t) if not pd.isna(ask_t) else np.nan
             return {
                 "pnlPerShare": (open_mid - ask_t) if not pd.isna(ask_t) else old_penalty,
                 "pnlSettleTime": future_time,
@@ -647,12 +670,26 @@ def run_low_price_prepared_day(
     }
     security_codes = sorted(set(signal_by_security) & set(orders_by_security))
 
+    aligned_price_df = load_aligned_price_df(
+        trade_date=trade_date,
+        pool_name=pool_name,
+        security_codes=security_codes,
+        ddb_config=ddb_config,
+    )
+    aligned_by_security = {
+        security_code: sec_df.reset_index(drop=True)
+        for security_code, sec_df in aligned_price_df.groupby("securityCode", sort=True)
+    } if not aligned_price_df.empty else {}
+
+
     # TickMidCache 懒加载单票 tick，避免一次性读全市场 tick；每只票只读一次后在三个 variant 间复用。
     tick_cache = TickMidCache(trade_date=trade_date, ddb_config=ddb_config)
     try:
         for security_code in security_codes:
             tick_df = tick_cache.get(security_code)
-            sec_signal_df = _add_next_price_move_cols(_merge_tick_to_signal(signal_by_security[security_code], tick_df))
+            sec_signal_df = signal_by_security[security_code]
+            sec_signal_df = _merge_aligned_to_signal(sec_signal_df, aligned_by_security.get(security_code, pd.DataFrame()))
+            sec_signal_df = _add_next_price_move_cols(_merge_tick_to_signal(sec_signal_df, tick_df))
             sec_order_df = orders_by_security[security_code]
             for variant_tag in LOW_PRICE_VARIANTS:
                 raw_events = _match_orders_to_signals(
