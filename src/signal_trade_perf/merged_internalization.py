@@ -137,7 +137,8 @@ def route_merged_orders(
             pd.Timestamp(row.barTime): row
             for row in sec_prediction_df.itertuples(index=False)
         }
-        for order in sec_orders_df.sort_values("clientOrderTime").to_dict(orient="records"):
+        # 与 high-price 主链路保持同一时间戳订单的稳定顺序，避免 position-cap 口径漂移。
+        for order in sec_orders_df.sort_values("clientOrderTime", kind="mergesort").to_dict(orient="records"):
             order_time = pd.Timestamp(order["clientOrderTime"])
             client_side = str(order["clientSide"]).upper()
             prediction_row, prediction_idx = _latest_prediction_signal(
@@ -323,6 +324,15 @@ def build_merged_summary(
     for prediction_variant in PREDICTION_VARIANTS:
         prediction_row = prediction_summary_df[prediction_summary_df["variantTag"] == prediction_variant].iloc[0].to_dict()
         prediction_variant_trades = _select_prediction_variant_trades(prediction_trades_df, prediction_variant)
+        # prediction summary 已经过输出格式化，资金占用直接从该 variant 的真实 trades 重算。
+        prediction_capital = _trade_df_to_capital_metrics(
+            _capital_metric_trade_slice(prediction_variant_trades)
+        )
+        prediction_capital_adjusted_return = (
+            np.nan
+            if float(prediction_capital["maxCapitalUsed"]) == 0
+            else float(prediction_row["totalExecPnl"]) / float(prediction_capital["maxCapitalUsed"])
+        )
         for fill_variant in LOW_PRICE_VARIANTS:
             fill_row = fill_rows.get(
                 fill_variant,
@@ -388,9 +398,9 @@ def build_merged_summary(
                     "predictionExecPnl": float(prediction_row["totalExecPnl"]),
                     "predictionMatchedNotional": float(prediction_row["totalMatchedNotional"]),
                     "predictionMatchedClientAmt": float(prediction_row["matchedClientAmt"]),
-                    "predictionMaxCapitalUsed": float(prediction_row["maxCapitalUsed"]),
-                    "predictionP95CapitalUsedByEvent": float(prediction_row["p95CapitalUsedByEvent"]),
-                    "predictionCapitalAdjustedReturn": prediction_row.get("capitalAdjustedReturn", np.nan),
+                    "predictionMaxCapitalUsed": float(prediction_capital["maxCapitalUsed"]),
+                    "predictionP95CapitalUsedByEvent": float(prediction_capital["p95CapitalUsedByEvent"]),
+                    "predictionCapitalAdjustedReturn": prediction_capital_adjusted_return,
                     "fillRateTradeCount": int(fill_row["totalTradeCount"]),
                     "fillRateExecPnl": float(fill_row["totalExecPnl"]),
                     "fillRateMatchedNotional": float(fill_row["totalMatchedNotional"]),

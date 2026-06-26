@@ -97,7 +97,7 @@ def _is_near_low_limit(row: pd.Series, low_limit: float) -> bool:
 
 
 def _should_block_open(row: pd.Series, inventory_side: str, high_limit: float, low_limit: float) -> str | None:
-    # 接近涨停时不再开空仓，接近跌停时不再开多仓，避免后续无法买回/卖出。
+    # 接近涨停时不再开空仓，接近跌停时不再开多仓，避免后续无法买回或卖出。
     if inventory_side == "SHORT" and _is_near_high_limit(row, high_limit):
         return "near_high_limit_no_short_open"
     if inventory_side == "LONG" and _is_near_low_limit(row, low_limit):
@@ -440,7 +440,7 @@ def _assign_price_bins(open_mid_price: pd.Series) -> tuple[pd.Series, pd.Series]
 
 
 def _calc_prev_day_vol_from_price_df(price_df: pd.DataFrame) -> pd.DataFrame:
-    # 这里不再依赖旧的 15s quote cache，而是直接用 DDB_Returns 对齐价格
+    # 这里不再依赖旧的 15s quote cache，而是直接用 DDB_Returns 对齐价格。
     # 计算前一交易日逐信号 bar 的收益波动，供 meta 分桶时使用。
     if price_df.empty:
         return pd.DataFrame(columns=["securityCode", "prevDayVol"])
@@ -486,7 +486,7 @@ def _load_latest_tick_mid_for_orders(
     matched_order_df: pd.DataFrame,
     tick_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    # 开仓价使用“客户单到来前最近一笔 tick 的 mid”，
+    # 开仓价使用客户单到来前最近一笔 tick 的 mid。
     # 同时把过去 5 个 tick 的买一/卖一量均值一并带出来，供流动性过滤使用。
     if matched_order_df.empty:
         return matched_order_df.assign(
@@ -566,7 +566,7 @@ class TickMidCache:
             if not tick_df.empty:
                 tick_df = tick_df.sort_values("tickTime").reset_index(drop=True)
                 tick_df = _filter_tick_to_trading_windows(tick_df, self.continuous_auction_windows)
-                # 盘口量约束使用“最近 5 个 tick 的一档量均值”。
+                # 盘口量约束使用最近 5 个 tick 的一档量均值。
                 tick_df["avgBidVol1Last5"] = tick_df["bidVol1Tick"].rolling(window=5, min_periods=1).mean()
                 tick_df["avgAskVol1Last5"] = tick_df["askVol1Tick"].rolling(window=5, min_periods=1).mean()
                 tick_df["liquidityCapQtyMin5"] = np.floor(
@@ -934,37 +934,33 @@ def _simulate_position_cap_lifecycle(
 
     if not sec_signal_df.empty:
         last_row = sec_signal_df.iloc[-1]
-        last_idx = len(sec_signal_df) - 1
-        for pos in long_open_positions:
-            cap_trade_rows.append(
-                _build_trade_record(
-                    pool_name=pool_name,
-                    security_code=security_code,
-                    trade_date=trade_date,
-                    position=pos,
-                    close_row=last_row,
-                    hold_signal_count=last_idx - int(pos["openRowIdx"]),
-                    close_type="EOD",
-                    price_bucket_low=price_bucket_low,
-                    price_bucket_high=price_bucket_high,
-                    prev_day_vol=prev_day_vol,
-                )
+        # EOD 只强平剩余未平数量，避免 partial close 后按原始数量重复计入。
+        cap_trade_rows.extend(
+            _close_positions(
+                positions=long_open_positions,
+                row=last_row,
+                pool_name=pool_name,
+                security_code=security_code,
+                trade_date=trade_date,
+                close_type="EOD",
+                price_bucket_low=price_bucket_low,
+                price_bucket_high=price_bucket_high,
+                prev_day_vol=prev_day_vol,
             )
-        for pos in short_open_positions:
-            cap_trade_rows.append(
-                _build_trade_record(
-                    pool_name=pool_name,
-                    security_code=security_code,
-                    trade_date=trade_date,
-                    position=pos,
-                    close_row=last_row,
-                    hold_signal_count=last_idx - int(pos["openRowIdx"]),
-                    close_type="EOD",
-                    price_bucket_low=price_bucket_low,
-                    price_bucket_high=price_bucket_high,
-                    prev_day_vol=prev_day_vol,
-                )
+        )
+        cap_trade_rows.extend(
+            _close_positions(
+                positions=short_open_positions,
+                row=last_row,
+                pool_name=pool_name,
+                security_code=security_code,
+                trade_date=trade_date,
+                close_type="EOD",
+                price_bucket_low=price_bucket_low,
+                price_bucket_high=price_bucket_high,
+                prev_day_vol=prev_day_vol,
             )
+        )
 
     for trade_row in cap_trade_rows:
         trade_row[variant_column] = True
@@ -983,9 +979,9 @@ def simulate_internalization_day(
     match_window_seconds: int | None = 10,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # 单票内部的主流程：
-    # 1. 客户子单在 signal 窗口内匹配开仓信号
-    # 2. 用 tick mid 生成开仓价
-    # 3. 按 signal bar 序列管理持仓并在满足平仓阈值时出场
+    # 1. 客户子单在 signal 窗口内匹配开仓信号。
+    # 2. 用 tick mid 生成开仓价。
+    # 3. 按 signal bar 序列管理持仓，并在满足平仓阈值时出场。
     if signal_df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
@@ -1000,20 +996,21 @@ def simulate_internalization_day(
     position_cap_trade_frames: list[pd.DataFrame] = []
     position_cap_position_frames: list[pd.DataFrame] = []
 
-    # 先按股票拆分 signal 和客户子单。只有两边都有数据的股票才进入逐票模拟，避免无意义拉 tick。
+    # 先按股票拆分 signal 和客户子单；只有两边都有数据的股票才进入逐票模拟，避免无意义拉 tick。
     signal_by_security = {
         security_code: sec_df.sort_values("barTime").reset_index(drop=True)
         for security_code, sec_df in signal_df.groupby("securityCode", sort=True)
     }
     orders_by_security = {
-        security_code: sec_df.sort_values("clientOrderTime").reset_index(drop=True)
+        # 同一时间戳的客户单保持原始相对顺序，position-cap partial 对顺序敏感。
+        security_code: sec_df.sort_values("clientOrderTime", kind="mergesort").reset_index(drop=True)
         for security_code, sec_df in client_order_df.groupby("securityCode", sort=True)
     }
 
     security_codes = sorted(set(signal_by_security) & set(orders_by_security))
 
     for security_code in security_codes:
-        # 每只股票独立模拟：signal/订单/Returns 价格/tick 价格都只取当前股票，控制内存占用。
+        # 每只股票独立模拟，signal、订单、Returns 价格和 tick 价格都只取当前股票，控制内存占用。
         sec_signal_df = signal_by_security.get(security_code, pd.DataFrame())
         sec_orders_df = orders_by_security.get(security_code, pd.DataFrame())
         sec_close_df = close_price_map.get(security_code, pd.DataFrame())
@@ -1071,7 +1068,7 @@ def simulate_internalization_day(
                 if match_window_seconds is None
                 else order_time - pd.Timedelta(seconds=match_window_seconds)
             )
-            # 信号先来、客户单后到：
+            # 信号先来、客户单后到。
             # 在客户单之前最近的一条 signal 上找开仓机会，并要求落在匹配窗口内。
             matched_idx = int(signal_times.searchsorted(order_time.to_datetime64(), side="right") - 1)
             matched_row = None

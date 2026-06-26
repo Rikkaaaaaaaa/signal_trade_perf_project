@@ -82,7 +82,7 @@ def _find_latest_eligible_signal_row(
 
 
 def _merge_tick_to_signal(sec_signal_df: pd.DataFrame, tick_df: pd.DataFrame) -> pd.DataFrame:
-    # 给每个 signal bar 回填“这个 bar 之前最近一个 tick”的盘口价量。
+    # 给每个 signal bar 回填这个 bar 之前最近一个 tick 的盘口价量。
     # direction="backward" 保证不会偷看到 signal 之后的 tick。
     if sec_signal_df.empty:
         return sec_signal_df
@@ -147,7 +147,7 @@ def _merge_tick_to_orders(matched_order_df: pd.DataFrame, tick_df: pd.DataFrame)
 
 
 def _merge_aligned_to_signal(sec_signal_df: pd.DataFrame, aligned_price_df: pd.DataFrame) -> pd.DataFrame:
-    # ?????? tick ????????????????? signal ?????? Prices_* ???
+    # 合并 Prices_* 对齐盘口，后续价格路径优先使用对齐价格。
     if sec_signal_df.empty:
         return sec_signal_df
     if aligned_price_df.empty:
@@ -178,7 +178,7 @@ def _cap_qty(row: pd.Series, variant_tag: str) -> int:
 
 
 def _next_price_move_indices(values: pd.Series) -> tuple[np.ndarray, np.ndarray]:
-    # 对每个 signal bar 预计算“未来第一次价格上移/下移”的行号，后续逐笔查表即可 O(1)。
+    # 对每个 signal bar 预计算未来第一次价格上移/下移的行号，后续逐笔查表即可 O(1)。
     arr = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
     n = len(arr)
     next_up = np.full(n, -1, dtype=int)
@@ -200,7 +200,7 @@ def _next_price_move_indices(values: pd.Series) -> tuple[np.ndarray, np.ndarray]
 
 
 def _add_next_price_move_cols(sec_signal_df: pd.DataFrame) -> pd.DataFrame:
-    # ???? PnL ??????????????LONG ? ask1?SHORT ? bid1?
+    # 价格路径 PnL 使用对手盘口：LONG 看 ask1，SHORT 看 bid1。
     if sec_signal_df.empty:
         return sec_signal_df
     result_df = sec_signal_df.copy()
@@ -334,13 +334,28 @@ def _low_price_price_path_pnl(
                 "pricePathReason": "bid_up_first",
             }
 
-    eod_time = pd.Timestamp(sec_signal_df.iloc[-1].barTime) if not sec_signal_df.empty else signal_time
+    # 到收盘前仍没有价格跳动时，按 EOD 对手方盘口退出；盘口缺失时才退回旧的 spread 惩罚。
+    eod_row = sec_signal_df.iloc[-1] if not sec_signal_df.empty else signal_row
+    eod_time = pd.Timestamp(eod_row.barTime) if not pd.isna(eod_row.get("barTime", pd.NaT)) else signal_time
+    if side == "LONG":
+        # LONG 库存卖出平仓，优先用 Prices_* 的 bid1，缺失时用 tick 回填。
+        eod_close_price = eod_row.get("closeBid1Aligned", np.nan)
+        if pd.isna(eod_close_price):
+            eod_close_price = eod_row.get("bidPrice1Tick", np.nan)
+        pnl_per_share = (float(eod_close_price) - open_mid) if not pd.isna(eod_close_price) else old_penalty
+    else:
+        # SHORT 库存买入平仓，优先用 Prices_* 的 ask1，缺失时用 tick 回填。
+        eod_close_price = eod_row.get("closeAsk1Aligned", np.nan)
+        if pd.isna(eod_close_price):
+            eod_close_price = eod_row.get("askPrice1Tick", np.nan)
+        pnl_per_share = (open_mid - float(eod_close_price)) if not pd.isna(eod_close_price) else old_penalty
+
     return {
-        "pnlPerShare": old_penalty,
+        "pnlPerShare": pnl_per_share,
         "pnlSettleTime": eod_time,
         "postedPrice": posted_price,
-        "pricePathClosePrice": np.nan,
-        "pnlModel": "price_path_no_move_spread_penalty",
+        "pricePathClosePrice": float(eod_close_price) if not pd.isna(eod_close_price) else np.nan,
+        "pnlModel": "price_path_no_move_eod_opposite_quote",
         "pricePathReason": "no_price_move_before_eod",
     }
 
@@ -479,7 +494,7 @@ def _simulate_security_variant(
     }
 
     def release_active(side: str, close_time: pd.Timestamp, reset_reason: str) -> None:
-        # 低价股挂单 PnL 在 y_test 处立即结算，但资金占用要等一档价格变化或 EOD 才释放。
+        # 到收盘前仍没有价格跳动时，按 EOD 对手方盘口退出；盘口缺失时才退回旧的 spread 惩罚。
         nonlocal long_qty, short_qty, long_active_trade_idxs, short_active_trade_idxs
         active_idxs = long_active_trade_idxs if side == "LONG" else short_active_trade_idxs
         for trade_idx in active_idxs:
@@ -609,7 +624,7 @@ def _match_orders_to_signals(
     params: LowPriceBacktestParams,
 ) -> list[dict[str, Any]]:
     # 只看客户单到达前最近一条 signal，再判断它是否符合方向/rank 和 match window。
-    # 不能往前翻历史 eligible signal；否则 unlimited 会变成“历史上曾经出现过即可匹配”。
+    # 不能往前翻历史 eligible signal；否则 unlimited 会变成历史上曾经出现过即可匹配。
     event_rows: list[dict[str, Any]] = []
     for order in sec_order_df.to_dict(orient="records"):
         client_side = str(order["clientSide"]).upper()
