@@ -397,6 +397,11 @@ def build_merged_summary(
                     "predictionTradeCount": int(prediction_row["totalTradeCount"]),
                     "predictionExecPnl": float(prediction_row["totalExecPnl"]),
                     "predictionMatchedNotional": float(prediction_row["totalMatchedNotional"]),
+                    "predictionNotionalWeightedExecRet": (
+                        np.nan
+                        if float(prediction_row["totalMatchedNotional"]) == 0
+                        else float(prediction_row["totalExecPnl"]) / float(prediction_row["totalMatchedNotional"])
+                    ),
                     "predictionMatchedClientAmt": float(prediction_row["matchedClientAmt"]),
                     "predictionMaxCapitalUsed": float(prediction_capital["maxCapitalUsed"]),
                     "predictionP95CapitalUsedByEvent": float(prediction_capital["p95CapitalUsedByEvent"]),
@@ -404,6 +409,11 @@ def build_merged_summary(
                     "fillRateTradeCount": int(fill_row["totalTradeCount"]),
                     "fillRateExecPnl": float(fill_row["totalExecPnl"]),
                     "fillRateMatchedNotional": float(fill_row["totalMatchedNotional"]),
+                    "fillRateNotionalWeightedExecRet": (
+                        np.nan
+                        if float(fill_row["totalMatchedNotional"]) == 0
+                        else float(fill_row["totalExecPnl"]) / float(fill_row["totalMatchedNotional"])
+                    ),
                     "fillRateMatchedClientAmt": float(fill_row["matchedClientAmt"]),
                     "fillRateMaxCapitalUsed": float(fill_row["maxCapitalUsed"]),
                     "fillRateP95CapitalUsedByEvent": float(fill_row["p95CapitalUsedByEvent"]),

@@ -323,6 +323,8 @@ def _aggregate_total(daily_df: pd.DataFrame) -> pd.DataFrame:
         fill_rate_daily_capital = pd.to_numeric(group_df["fillRateMaxCapitalUsed"], errors="coerce").dropna()
         prediction_exec_pnl = float(group_df["predictionExecPnl"].astype(float).sum())
         fill_rate_exec_pnl = float(group_df["fillRateExecPnl"].astype(float).sum())
+        prediction_notional = float(group_df["predictionMatchedNotional"].astype(float).sum())
+        fill_rate_notional = float(group_df["fillRateMatchedNotional"].astype(float).sum())
         by_date_ret = pd.to_numeric(group_df["notionalWeightedExecRet"], errors="coerce").dropna()
         row.update(
             {
@@ -332,8 +334,12 @@ def _aggregate_total(daily_df: pd.DataFrame) -> pd.DataFrame:
                 "predictionExecPnl": prediction_exec_pnl,
                 "fillRateExecPnl": fill_rate_exec_pnl,
                 "totalMatchedNotional": total_notional,
+                "predictionMatchedNotional": prediction_notional,
+                "fillRateMatchedNotional": fill_rate_notional,
                 "predictionMaxDailyCapitalUsed": float(prediction_daily_capital.max()) if len(prediction_daily_capital) else 0.0,
                 "fillRateMaxDailyCapitalUsed": float(fill_rate_daily_capital.max()) if len(fill_rate_daily_capital) else 0.0,
+                "predictionNotionalWeightedExecRet": np.nan if prediction_notional == 0 else prediction_exec_pnl / prediction_notional,
+                "fillRateNotionalWeightedExecRet": np.nan if fill_rate_notional == 0 else fill_rate_exec_pnl / fill_rate_notional,
                 "predictionCapitalAdjustedReturn": (
                     np.nan if not len(prediction_daily_capital) or float(prediction_daily_capital.max()) == 0 else prediction_exec_pnl / float(prediction_daily_capital.max())
                 ),
@@ -371,9 +377,9 @@ def _print_combo_report(total_df: pd.DataFrame) -> None:
         "predictionExecPnl",
         "fillRateExecPnl",
         "predictionMaxDailyCapitalUsed",
-        "predictionCapitalAdjustedReturn",
+        "predictionNotionalWeightedExecRet",
         "fillRateMaxDailyCapitalUsed",
-        "fillRateCapitalAdjustedReturn",
+        "fillRateNotionalWeightedExecRet",
         "mergedMaxDailyCapitalUsed",
         "mergedCapitalAdjustedReturn",
         "clientAmtMatchRate",
