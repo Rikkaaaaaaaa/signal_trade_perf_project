@@ -319,15 +319,27 @@ def _aggregate_total(daily_df: pd.DataFrame) -> pd.DataFrame:
         total_client_amt = float(group_df["totalClientAmt"].astype(float).sum())
         matched_client_amt = float(group_df["matchedClientAmt"].astype(float).sum())
         merged_daily_capital = pd.to_numeric(group_df["mergedMaxCapitalUsed"], errors="coerce").dropna()
+        prediction_daily_capital = pd.to_numeric(group_df["predictionMaxCapitalUsed"], errors="coerce").dropna()
+        fill_rate_daily_capital = pd.to_numeric(group_df["fillRateMaxCapitalUsed"], errors="coerce").dropna()
+        prediction_exec_pnl = float(group_df["predictionExecPnl"].astype(float).sum())
+        fill_rate_exec_pnl = float(group_df["fillRateExecPnl"].astype(float).sum())
         by_date_ret = pd.to_numeric(group_df["notionalWeightedExecRet"], errors="coerce").dropna()
         row.update(
             {
                 "tradeDateCount": int(group_df["tradeDate"].nunique()),
                 "totalTradeCount": int(group_df["totalTradeCount"].astype(int).sum()),
                 "totalExecPnl": total_exec_pnl,
-                "predictionExecPnl": float(group_df["predictionExecPnl"].astype(float).sum()),
-                "fillRateExecPnl": float(group_df["fillRateExecPnl"].astype(float).sum()),
+                "predictionExecPnl": prediction_exec_pnl,
+                "fillRateExecPnl": fill_rate_exec_pnl,
                 "totalMatchedNotional": total_notional,
+                "predictionMaxDailyCapitalUsed": float(prediction_daily_capital.max()) if len(prediction_daily_capital) else 0.0,
+                "fillRateMaxDailyCapitalUsed": float(fill_rate_daily_capital.max()) if len(fill_rate_daily_capital) else 0.0,
+                "predictionCapitalAdjustedReturn": (
+                    np.nan if not len(prediction_daily_capital) or float(prediction_daily_capital.max()) == 0 else prediction_exec_pnl / float(prediction_daily_capital.max())
+                ),
+                "fillRateCapitalAdjustedReturn": (
+                    np.nan if not len(fill_rate_daily_capital) or float(fill_rate_daily_capital.max()) == 0 else fill_rate_exec_pnl / float(fill_rate_daily_capital.max())
+                ),
                 "clientAmtMatchRate": np.nan if total_client_amt == 0 else matched_client_amt / total_client_amt,
                 "notionalWeightedExecRet": np.nan if total_notional == 0 else total_exec_pnl / total_notional,
                 "mergedMaxDailyCapitalUsed": float(merged_daily_capital.max()) if len(merged_daily_capital) else 0.0,
@@ -343,6 +355,32 @@ def _aggregate_total(daily_df: pd.DataFrame) -> pd.DataFrame:
         )
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def _print_combo_report(total_df: pd.DataFrame) -> None:
+    if total_df.empty:
+        return
+    report_df = total_df[total_df["predictionVariantTag"] == "poscap_avg5x5_partial"].copy()
+    if report_df.empty:
+        return
+    report_cols = [
+        "predictionVariantTag",
+        "fillRateVariantTag",
+        "totalTradeCount",
+        "totalExecPnl",
+        "predictionExecPnl",
+        "fillRateExecPnl",
+        "predictionMaxDailyCapitalUsed",
+        "predictionCapitalAdjustedReturn",
+        "fillRateMaxDailyCapitalUsed",
+        "fillRateCapitalAdjustedReturn",
+        "mergedMaxDailyCapitalUsed",
+        "mergedCapitalAdjustedReturn",
+        "clientAmtMatchRate",
+        "notionalWeightedExecRet",
+    ]
+    report_cols = [col for col in report_cols if col in report_df.columns]
+    print(report_df[report_cols].to_string(index=False))
 
 
 def main() -> None:
@@ -529,6 +567,7 @@ def main() -> None:
             }
         )
         print(f"[combo {combo_idx}/{len(param_grid)}] done {combo_tag} elapsedSeconds={combo_elapsed:.2f}")
+        _print_combo_report(total_df)
 
     combined_daily_df = pd.concat(all_daily_frames, ignore_index=True) if all_daily_frames else pd.DataFrame()
     combined_total_df = pd.concat(all_total_frames, ignore_index=True) if all_total_frames else pd.DataFrame()

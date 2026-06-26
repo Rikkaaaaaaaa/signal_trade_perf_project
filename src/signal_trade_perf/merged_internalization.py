@@ -281,6 +281,16 @@ def _trade_df_to_capital_metrics(trade_df: pd.DataFrame) -> dict[str, float]:
     return capital_metrics_from_events(pd.DataFrame(event_rows))
 
 
+def _capital_metric_trade_slice(trade_df: pd.DataFrame) -> pd.DataFrame:
+    if trade_df.empty:
+        return pd.DataFrame(columns=["openTime", "closeTime", "openNotional"])
+    keep_cols = [col for col in ["openTime", "closeTime", "openNotional"] if col in trade_df.columns]
+    if len(keep_cols) < 3:
+        missing_cols = [col for col in ["openTime", "closeTime", "openNotional"] if col not in keep_cols]
+        return trade_df[keep_cols].assign(**{col: np.nan for col in missing_cols})[["openTime", "closeTime", "openNotional"]]
+    return trade_df[["openTime", "closeTime", "openNotional"]].copy()
+
+
 def _select_prediction_variant_trades(
     trades_df: pd.DataFrame,
     variant_tag: str,
@@ -336,9 +346,12 @@ def build_merged_summary(
                 else pd.DataFrame()
             )
             combined_trades_df = pd.concat(
-                [prediction_variant_trades, fill_variant_trades],
+                [
+                    _capital_metric_trade_slice(prediction_variant_trades),
+                    _capital_metric_trade_slice(fill_variant_trades),
+                ],
                 ignore_index=True,
-            ) if not prediction_variant_trades.empty or not fill_variant_trades.empty else pd.DataFrame()
+            ) if not prediction_variant_trades.empty or not fill_variant_trades.empty else pd.DataFrame(columns=["openTime", "closeTime", "openNotional"])
             merged_capital = _trade_df_to_capital_metrics(combined_trades_df)
             total_exec_pnl = float(prediction_row["totalExecPnl"]) + float(fill_row["totalExecPnl"])
             total_matched_notional = float(prediction_row["totalMatchedNotional"]) + float(fill_row["totalMatchedNotional"])
@@ -377,12 +390,14 @@ def build_merged_summary(
                     "predictionMatchedClientAmt": float(prediction_row["matchedClientAmt"]),
                     "predictionMaxCapitalUsed": float(prediction_row["maxCapitalUsed"]),
                     "predictionP95CapitalUsedByEvent": float(prediction_row["p95CapitalUsedByEvent"]),
+                    "predictionCapitalAdjustedReturn": prediction_row.get("capitalAdjustedReturn", np.nan),
                     "fillRateTradeCount": int(fill_row["totalTradeCount"]),
                     "fillRateExecPnl": float(fill_row["totalExecPnl"]),
                     "fillRateMatchedNotional": float(fill_row["totalMatchedNotional"]),
                     "fillRateMatchedClientAmt": float(fill_row["matchedClientAmt"]),
                     "fillRateMaxCapitalUsed": float(fill_row["maxCapitalUsed"]),
                     "fillRateP95CapitalUsedByEvent": float(fill_row["p95CapitalUsedByEvent"]),
+                    "fillRateCapitalAdjustedReturn": fill_row.get("capitalAdjustedReturn", np.nan),
                     "fillRateYTestWinRate": fill_row.get("yTestWinRate", np.nan),
                     "mergedMaxCapitalUsed": float(merged_capital["maxCapitalUsed"]),
                     "mergedP95CapitalUsedByEvent": float(merged_capital["p95CapitalUsedByEvent"]),

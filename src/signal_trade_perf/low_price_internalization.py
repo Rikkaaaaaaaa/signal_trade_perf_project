@@ -213,7 +213,7 @@ def _add_next_price_move_cols(sec_signal_df: pd.DataFrame) -> pd.DataFrame:
 
 def _log_price_path_fallback(message: str) -> None:
     # y_test=0 但价格先向有利方向变化时，说明标签可能偏保守；同时打印和落日志方便复盘。
-    print(message)
+    # print(message)
     log_path = Path.cwd() / "results" / "internalization_backtest" / "logs" / "low_price_price_path_fallback.log"
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
