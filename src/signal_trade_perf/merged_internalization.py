@@ -10,6 +10,7 @@ from .core import BacktestParams
 from .internalization import run_internalization_prepared_day
 from .internalization_capital import capital_metrics_from_events, select_variant_trades
 from .low_price_internalization import LOW_PRICE_VARIANTS, LowPriceBacktestParams, run_low_price_prepared_day
+from .merged_result_stats import build_merged_security_summary
 
 
 PREDICTION_VARIANTS = [
@@ -432,7 +433,7 @@ def build_merged_summary(
 def run_merged_prepared_day(
     prepared_inputs: dict[str, object],
     params: MergedBacktestParams,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     trade_date = str(prepared_inputs["tradeDate"])
     pool_name = str(prepared_inputs["poolName"])
     client_order_df = prepared_inputs["clientOrderDf"]
@@ -504,6 +505,15 @@ def run_merged_prepared_day(
         fill_rate_summary_df=fill_rate_summary_df,
         fill_rate_trades_df=fill_rate_trades_df,
     )
+    merged_security_summary_df = build_merged_security_summary(
+        pool_name=pool_name,
+        trade_date=trade_date,
+        meta_df=prepared_inputs["metaDf"],
+        client_order_df=client_order_df,
+        prediction_security_summary_df=prediction_security_summary_df,
+        fill_rate_trades_df=fill_rate_trades_df,
+        variant_tags=None,
+    )
     return (
         route_df,
         prediction_order_events_df,
@@ -513,4 +523,5 @@ def run_merged_prepared_day(
         fill_rate_summary_df,
         merged_summary_df,
         prediction_pool_summary_df,
+        merged_security_summary_df,
     )

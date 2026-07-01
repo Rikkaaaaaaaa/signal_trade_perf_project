@@ -101,6 +101,7 @@ def _parse_pools(raw: str) -> list[str]:
     return pools
 
 
+
 def _discover_ims_trade_dates(ims_roots: list[Path], start_date: str, end_date: str) -> list[str]:
     trade_dates: set[str] = set()
     for ims_root in ims_roots:
@@ -170,6 +171,7 @@ def _empty_result(trade_date: str, params: MergedBacktestParams, elapsed: float,
         "predictionTradeRows": [],
         "fillRateOrderEventRows": [],
         "fillRateTradeRows": [],
+        "mergedSecurityRows": [],
     }
 
 
@@ -204,6 +206,7 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
     prediction_trade_rows: list[dict[str, Any]] = []
     fill_rate_order_event_rows: list[dict[str, Any]] = []
     fill_rate_trade_rows: list[dict[str, Any]] = []
+    merged_security_rows: list[dict[str, Any]] = []
     try:
         cache_mode = str(task["cacheMode"])
         cache_root = Path(str(task["cacheRoot"]))
@@ -250,6 +253,7 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
                 fill_rate_summary_df,
                 merged_summary_df,
                 prediction_pool_summary_df,
+                merged_security_summary_df,
             ) = run_merged_prepared_day(
                 prepared_inputs=prepared_inputs,
                 params=params,
@@ -270,6 +274,8 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
                 fill_rate_order_event_rows.extend(fill_rate_order_events_df.to_dict(orient="records"))
             if not fill_rate_trades_df.empty:
                 fill_rate_trade_rows.extend(fill_rate_trades_df.to_dict(orient="records"))
+            if not merged_security_summary_df.empty:
+                merged_security_rows.extend(merged_security_summary_df.to_dict(orient="records"))
 
         return {
             "tradeDate": trade_date,
@@ -287,6 +293,7 @@ def _run_one_date(task: dict[str, Any]) -> dict[str, Any]:
             "predictionTradeRows": prediction_trade_rows,
             "fillRateOrderEventRows": fill_rate_order_event_rows,
             "fillRateTradeRows": fill_rate_trade_rows,
+            "mergedSecurityRows": merged_security_rows,
         }
     except Exception:
         return _empty_result(trade_date=trade_date, params=params, elapsed=perf_counter() - start, error=traceback.format_exc())
@@ -515,6 +522,7 @@ def main() -> None:
         prediction_trade_rows: list[dict[str, Any]] = []
         fill_rate_order_event_rows: list[dict[str, Any]] = []
         fill_rate_trade_rows: list[dict[str, Any]] = []
+        merged_security_rows: list[dict[str, Any]] = []
         timing_rows: list[dict[str, Any]] = []
         with context.Pool(processes=args.processes) as pool:
             for result in pool.imap_unordered(_run_one_date, tasks):
@@ -524,7 +532,8 @@ def main() -> None:
                 prediction_trade_rows.extend(result.get("predictionTradeRows", []))
                 fill_rate_order_event_rows.extend(result.get("fillRateOrderEventRows", []))
                 fill_rate_trade_rows.extend(result.get("fillRateTradeRows", []))
-                timing_rows.append({key: value for key, value in result.items() if key not in {"mergedRows", "predictionRows", "fillRateRows", "routeRows", "predictionOrderEventRows", "predictionTradeRows", "fillRateOrderEventRows", "fillRateTradeRows"}})
+                merged_security_rows.extend(result.get("mergedSecurityRows", []))
+                timing_rows.append({key: value for key, value in result.items() if key not in {"mergedRows", "predictionRows", "fillRateRows", "routeRows", "predictionOrderEventRows", "predictionTradeRows", "fillRateOrderEventRows", "fillRateTradeRows", "mergedSecurityRows"}})
                 print(
                     f"[combo {combo_idx}/{len(param_grid)}] [date {len(timing_rows)}/{len(trade_dates)}] "
                     f"{result['tradeDate']} status={result['status']} elapsed={float(result['elapsedSeconds']):.2f}s "
@@ -538,6 +547,7 @@ def main() -> None:
         fill_rate_order_event_df = pd.DataFrame(fill_rate_order_event_rows)
         fill_rate_trade_df = pd.DataFrame(fill_rate_trade_rows)
         merged_trade_df = pd.concat([prediction_trade_df, fill_rate_trade_df], ignore_index=True, sort=False) if not prediction_trade_df.empty or not fill_rate_trade_df.empty else pd.DataFrame()
+        merged_security_df = pd.DataFrame(merged_security_rows)
         timing_df = pd.DataFrame(timing_rows).sort_values("tradeDate").reset_index(drop=True) if timing_rows else pd.DataFrame()
         total_df = _aggregate_total(daily_df)
         combo_elapsed = perf_counter() - combo_start
@@ -548,6 +558,8 @@ def main() -> None:
         dataframe_to_csv_with_retry(fill_rate_order_event_df, combo_dir / "fill_rate_order_events.csv", index=False)
         dataframe_to_csv_with_retry(fill_rate_trade_df, combo_dir / "fill_rate_trades.csv", index=False)
         dataframe_to_csv_with_retry(merged_trade_df, combo_dir / "merged_trades.csv", index=False)
+        if not merged_security_df.empty:
+            dataframe_to_csv_with_retry(merged_security_df, combo_dir / "by_ticker_daily_summary.csv", index=False)
         dataframe_to_csv_with_retry(total_df, combo_dir / "total_summary.csv", index=False)
         dataframe_to_csv_with_retry(timing_df, combo_dir / "date_timing.csv", index=False)
         dataframe_to_csv_with_retry(
